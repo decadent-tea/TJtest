@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>巡检台 UI 重构交付说明</title><style>*{font-family:SimSun,"宋体",serif!important;color:#000!important}body{max-width:960px;margin:40px auto;padding:0 24px;line-height:1.8;background:white}h1{font-size:26px}h2{font-size:19px;margin-top:30px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #999;padding:9px;text-align:left;font-size:14px}code{overflow-wrap:anywhere}li{margin:6px 0}</style></head><body>
+<h1>巡检台：产品级视觉重构交付说明</h1><p>2026-09-16 · 第一阶段：全局视觉系统、应用外壳、导航与体检首页。后端接口、数据协议及原业务功能保持原实现。</p>
+<h2>结构与视觉变化</h2><p>原首页重复标题、横排图标流程、四张 KPI 卡和两张内容卡，调整为主操作与证据链左右非对称构图、连续指标带、开放式最近记录区和石墨色准备面板。首页 Card 使用由 6 个降为 0 个。导航由 230px 深色面板改为 196px 浅色紧凑导航，保留全部七个入口和真实状态。</p>
+<h2>文件清单</h2><table><tr><th>文件</th><th>用途</th></tr>
+<tr><td>src/App.tsx</td><td>应用导航、语义按钮、选中态动效、页面进出过渡和首页氛围层。</td></tr>
+<tr><td>src/index.css</td><td>语义设计变量、排版、布局、材质层次、响应式与完整动效。</td></tr>
+<tr><td>src/components/studio.tsx</td><td>重组首页结构；复用 Table / Badge；替换任务名按钮；保留全部记录、流程库、系统维护、新建、演示入口。</td></tr>
+<tr><td>src/components/trace-map.tsx</td><td>子任务实现的 SVG 证据链；明确标注流程示意，不显示虚构运行指标。</td></tr>
+<tr><td>src/components/workspace-atmosphere.tsx</td><td>固定背景与基于滚动的轻量视差。</td></tr>
+<tr><td>public/visuals/backgrounds/workspace-mineral-depth.webp</td><td>生成并压缩的材质背景。</td></tr>
+<tr><td>index.html</td><td>浏览器主题颜色同步为雾白。</td></tr>
+<tr><td>docs/ui-redesign.html</td><td>本交付说明，黑色宋体。</td></tr></table>
+<h2>Primitive 审计</h2><p>已有组件：Alert、Badge、Button、Card、Dialog、Empty、Field、Input、Label、Select、Separator、Sonner、Switch、Table、Tabs、Textarea；另有 Magic UI NumberTicker。</p><p>首页实际使用 Button、Badge、Separator、Table 及其子组件、Empty 及其子组件。新建弹窗继续使用 Dialog、Field、Input。主导航和 RunTable 任务名原生 button 已替换为 Button；表格末列按钮显式调用原 onOpen。其他业务页中的原生按钮不在本阶段改造范围。</p><p>保留的 div 分别负责 Grid 布局、标题文字分组、指标容器、装饰材质平面及操作区域排列，不伪装按钮或输入控件。状态使用 Badge，空状态使用 Empty，区段分隔使用 Separator。</p>
+<h2>设计 Tokens</h2><p>沿用 shadcn 变量：background、foreground、card、popover、primary、secondary、muted、accent、destructive、border、input、ring、sidebar。新增 surface、surface-elevated、surface-dark、border-subtle、danger、warning、success、radius-panel、space-section、space-canvas、shadow-overlay、motion-fast、motion-enter、font-technical。</p><p>主色：雾白 #F7F8F6，墨色 #182724，青绿 #236C61，石墨 #152D29，辅助灰 #66736E，细线 #DCE2DD。常用控件圆角 8px，特殊面板 16px。标题 36–60px，中文系统无衬线，数字 Geist，辅助技术信息等宽字体。</p>
+<h2>视觉资产与动效</h2><p>背景由独立视觉子任务调用内置 imagegen 生成：乳白矿物/陶瓷切割层、右下主体、左侧留白、漫射日光、低对比灰绿阴影。无文字、Logo 或伪造 UI。原图 1672×941（约 16:9），1,669,947 字节；网页 WebP 66,082 字节（约 64.5 KiB），体积减少约 96%。原 PNG 保存在 output/visual-redesign/source-assets/，不进入网页公开资源。</p><p>使用位置：首页固定背景及证据链局部蒙版前景；HTML 大字位于材质后方，SVG 信息位于前方，形成多层景深。背景缺失时仍显示完整中性色页面；背景不承载业务信息，标记 aria-hidden，图像使用空 alt、明确尺寸、异步解码和低加载优先级。</p><p>Motion：导航选中指示移动、页面进入/退出、主体进入视口、背景滚动视差。CSS：32 秒低速路径移动及轻量悬停反馈。没有新增视频；本轮空间效果由静态材质与程序动画完成，无视频解码及额外下载。没有新增 Magic UI 特效；首页 NumberTicker 已移除，统计直接显示真实数值。</p><p>根据用户最终要求，完整动态效果持续启用，不跟随系统 prefers-reduced-motion 自动关闭；MotionConfig 使用 never，背景视差、页面切换和路径流动保留。</p>
+<h2>响应式与可访问性</h2><p>桌面：流动边距与有上限的证据链宽度；中小桌面：内容主次区上下排列；平板：标题与图形上下排列、指标两列；手机：可展开导航、两列指标、单列内容与局部横向滚动表格。检查 390、768、1024、1280、1440、1680、1920px；修复 768px 装饰平面造成的 2px 横向溢出。</p><p>保留可见焦点、按钮名称、aria-current、菜单 aria-expanded、Dialog 标题、SVG title/desc。表格操作在鼠标悬停或键盘焦点时出现，触摸设备始终可见。</p>
+<h2>验证结果</h2><table><tr><th>项目</th><th>结果</th></tr>
+<tr><td>npm run check / TypeScript</td><td>通过。</td></tr>
+<tr><td>npm run build</td><td>通过；Vite 保留单个 JS chunk 超过 500 kB 的体积提示，未通过提高阈值隐藏。最终 JS gzip 约 195 kB。</td></tr>
+<tr><td>npm run verify</td><td>通过：采集、录制、暂停恢复、对话框、容错回放、模型证据校验、HTML 与黑色宋体 Excel 导出。</td></tr>
+<tr><td>npm run verify:ai</td><td>通过：长录制批次、重试续传、汇总、压缩、引用校验与降级。</td></tr>
+<tr><td>npm run verify:ai-client</td><td>通过：流式解析、并发、断流、超时、取消及检查点。</td></tr>
+<tr><td>Lint</td><td>项目未配置 lint 脚本或 ESLint，不声明已通过；修改文件已用 Prettier 格式化。</td></tr>
+<tr><td>浏览器交互</td><td>新建弹窗、流程库跳转、手机菜单展开/收起及记录跳转、已有体检打开工作台通过；检查时未见控制台 error / warn。</td></tr>
+</table>
+<h2>为什么具有产品自身的识别度</h2><p>页面围绕真实的测试证据关系建立视觉中心，而不是围绕通用 KPI 卡片排列。大字号、轻导航、横向指标节奏和独立证据链负责信息层级；矿物材质与低速运动提供克制的空间感，记录表和操作入口保持清晰可用。</p></body></html>
