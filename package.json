@@ -10,10 +10,14 @@
     "check": "tsc --noEmit",
     "verify": "tsx scripts/verify.ts",
     "verify:hover": "tsx scripts/verify-hover.ts",
+    "verify:replay": "tsx scripts/verify-replay-network.ts && tsx scripts/verify-replay.ts",
+    "verify:replay:live": "tsx scripts/verify-replay-live.ts",
     "verify:quality": "tsx scripts/verify-quality.ts",
     "verify:ai": "tsx scripts/verify-ai.ts",
     "verify:ai-client": "tsx scripts/verify-ai-client.ts",
-    "verify:fixes": "tsx scripts/verify-fixes.ts"
+    "verify:fixes": "tsx scripts/verify-fixes.ts",
+    "verify:ui": "npm run build && tsx scripts/verify-ui.ts",
+    "verify:archive": "npm run build && tsx scripts/verify-archive.ts"
   },
   "dependencies": {
     "@fontsource-variable/geist": "^5.3.0",

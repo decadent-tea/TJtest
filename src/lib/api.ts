@@ -42,7 +42,7 @@ export const labels: Record<string, string> = {
   BLOCKED: "前置阻塞",
   SKIPPED: "已跳过",
   NONE: "未分析",
-  RUNNING: "正在分析",
+  RUNNING: "进行中",
   high: "高",
   medium: "中",
   low: "低",

@@ -6,7 +6,13 @@ export type RunStatus =
   | "COMPLETED_WITH_ISSUES"
   | "INTERRUPTED";
 export type StepStatus =
-  "RECORDED" | "PASSED" | "EXECUTED" | "FAILED" | "BLOCKED" | "SKIPPED";
+  | "RECORDED"
+  | "RUNNING"
+  | "PASSED"
+  | "EXECUTED"
+  | "FAILED"
+  | "BLOCKED"
+  | "SKIPPED";
 export type ActionKind =
   | "goto"
   | "click"
@@ -20,7 +26,7 @@ export type ActionKind =
   | "upload"
   | "dialog";
 export interface LocatorHint {
-  kind: "testId" | "role" | "label" | "css";
+  kind: "testId" | "role" | "label" | "css" | "xpath" | "text" | "placeholder";
   value: string;
   name?: string;
 }
@@ -28,6 +34,8 @@ export interface Operation {
   id: string;
   sequence: number;
   pageId: string;
+  openerPageId?: string;
+  navigationMode?: "navigate" | "observe";
   framePath: string[];
   timestamp: string;
   kind: ActionKind;
@@ -206,6 +214,14 @@ export interface Run {
   endedAt?: string;
   flowId?: string;
   flowVersion?: number;
+  viewport?: { width: number; height: number };
+  interruption?: {
+    reason: string;
+    at: string;
+    stepId?: string;
+    sequence?: number;
+    label?: string;
+  };
   scene: string;
   archived: boolean;
   operations: Operation[];
@@ -224,6 +240,7 @@ export interface Flow {
   url: string;
   version: number;
   sourceRunId: string;
+  viewport?: { width: number; height: number };
   createdAt: string;
   updatedAt: string;
   operations: Operation[];

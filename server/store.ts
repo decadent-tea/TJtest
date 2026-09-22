@@ -116,6 +116,27 @@ export function recoverInterrupted() {
   for (const run of list<Run>("run")) {
     let changed = false;
     if (["RECORDING", "PAUSED", "REPLAYING"].includes(run.status)) {
+      if (run.mode === "replay") {
+        const running = [...run.operations]
+          .reverse()
+          .find((op) => op.status === "RUNNING");
+        const location =
+          running ||
+          [...run.operations]
+            .reverse()
+            .find((op) => op.status !== "BLOCKED" && op.status !== "SKIPPED");
+        run.interruption = {
+          reason: "服务重启导致复检中断。",
+          at: new Date().toISOString(),
+          stepId: location?.id,
+          sequence: location?.sequence,
+          label: location?.label,
+        };
+        if (running) {
+          running.status = "FAILED";
+          running.error = run.interruption.reason;
+        }
+      }
       run.status = "INTERRUPTED";
       run.endedAt = new Date().toISOString();
       run.notes.push("服务重启导致执行中断；已保存证据可继续查看。");

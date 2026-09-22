@@ -39,6 +39,7 @@ function paragraph(
     | "toc"
     | "contents"
     | "table" = "body",
+  boldPrefix?: string,
 ) {
   const configuration = {
     body: {
@@ -145,10 +146,18 @@ function paragraph(
   const properties = `<w:pPr>${configuration.style ? `<w:pStyle w:val="${configuration.style}"/>` : ""}${["h1", "h2", "h3", "case"].includes(role) ? '<w:numPr><w:numId w:val="0"/></w:numPr><w:keepNext/><w:keepLines/>' : ""}<w:spacing w:before="${configuration.before}" w:after="${configuration.after}" w:line="${configuration.line}" w:lineRule="exact"/><w:ind w:firstLine="${configuration.indent}"/><w:jc w:val="${configuration.align}"/>${role === "conclusion" ? "<w:keepLines/>" : ""}</w:pPr>`;
   return `<w:p>${properties}${String(value)
     .split("\n")
-    .map(
-      (line, index) =>
-        `${index ? "<w:r><w:br/></w:r>" : ""}${run(line, configuration.size, configuration.bold)}`,
-    )
+    .map((line, index) => {
+      const content =
+        index === 0 && boldPrefix && line.startsWith(boldPrefix)
+          ? run(boldPrefix, configuration.size, true) +
+            run(
+              line.slice(boldPrefix.length),
+              configuration.size,
+              configuration.bold,
+            )
+          : run(line, configuration.size, configuration.bold);
+      return `${index ? "<w:r><w:br/></w:r>" : ""}${content}`;
+    })
     .join("")}</w:p>`;
 }
 const pageBreak = () => '<w:p><w:r><w:br w:type="page"/></w:r></w:p>';
@@ -258,7 +267,8 @@ export async function reportDocx(runData: Run): Promise<Buffer> {
             '<w:bookmarkEnd w:id="' + (10000 + i) + '"/></w:p>',
           ),
       );
-    else if (b.kind === "paragraph") add(paragraph(b.text));
+    else if (b.kind === "paragraph")
+      add(paragraph(b.text, "body", b.boldPrefix));
     else add(table(b.headers, b.rows));
   }
   const stylesFile = zip.file("word/styles.xml");

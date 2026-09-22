@@ -3,8 +3,10 @@ export function installCollector() {
   const win = window as unknown as {
     __healthEmit: (event: unknown) => Promise<void>;
     __healthFlush?: () => void;
+    __healthDocument?: Document;
   };
-  if (win.__healthFlush) return;
+  if (win.__healthDocument === document) return;
+  win.__healthDocument = document;
   const css = (el: Element): string => {
     if (
       el.id &&
@@ -69,12 +71,57 @@ export function installCollector() {
         : "");
     const name = text(el) || label || input.name || el.tagName.toLowerCase();
     const hints: { kind: string; value: string; name?: string }[] = [];
+    // Cascader IDs are regenerated on every load. Anchor child controls to the
+    // named menu item instead of retaining only that transient ID.
+    const menuItem = el.closest('[role="menuitem"],[role="option"]');
+    if (
+      el instanceof HTMLInputElement &&
+      ["radio", "checkbox"].includes(el.type) &&
+      menuItem &&
+      text(menuItem) &&
+      menuItem.querySelectorAll(`input[type="${el.type}"]`).length === 1
+    )
+      hints.push({
+        kind: "css",
+        value: `[role="${menuItem.getAttribute("role")}"]:has-text(${JSON.stringify(text(menuItem))}) input[type="${el.type}"]`,
+      });
     if (el.getAttribute("data-testid"))
       hints.push({ kind: "testId", value: el.getAttribute("data-testid")! });
     if (role && name && !["textbox", "combobox"].includes(role))
       hints.push({ kind: "role", value: role, name });
     if (label) hints.push({ kind: "label", value: label });
+    if (el.getAttribute("placeholder"))
+      hints.push({
+        kind: "placeholder",
+        value: el.getAttribute("placeholder")!,
+      });
+    for (const attribute of ["name", "title", "aria-label", "data-id"]) {
+      const value = el.getAttribute(attribute);
+      if (value)
+        hints.push({
+          kind: "css",
+          value: `${el.tagName.toLowerCase()}[${attribute}=${JSON.stringify(value)}]`,
+        });
+    }
+    if (!role && name.length <= 60 && name !== el.tagName.toLowerCase())
+      hints.push({
+        kind: "css",
+        value: `${el.tagName.toLowerCase()}:text-is(${JSON.stringify(name)})`,
+      });
     hints.push({ kind: "css", value: css(el) });
+    // Text XPath survives generated IDs and changes in unrelated siblings.
+    // Use only exact, untruncated text; ambiguous matches are never auto-picked.
+    const exactText = (el.textContent || "").trim().replace(/\s+/g, " ");
+    if (
+      exactText &&
+      exactText.length <= 90 &&
+      !exactText.includes("'") &&
+      !exactText.includes('"')
+    )
+      hints.push({
+        kind: "xpath",
+        value: `//${el.tagName.toLowerCase()}[normalize-space(.)='${exactText}']`,
+      });
     const active = Array.from(
       document.querySelectorAll(
         'nav [aria-current],aside [aria-selected="true"],.ant-menu-item-selected,.el-menu-item.is-active',
@@ -274,12 +321,9 @@ export function installCollector() {
           ?.querySelector('input[type="checkbox"],input[type="radio"]')
       )
         return;
-      if (
-        el instanceof HTMLSelectElement ||
-        el instanceof HTMLTextAreaElement ||
-        el instanceof HTMLInputElement
-      )
-        return;
+      // Text inputs (including readonly cascader triggers) and textareas can
+      // open menus or change focus. Filling later does not reproduce that click.
+      if (el instanceof HTMLSelectElement) return;
       if (el.tagName === "HTML" || el.tagName === "BODY") return;
       const data = snapshot(el);
       const style = getComputedStyle(el);

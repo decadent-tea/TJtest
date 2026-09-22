@@ -27,6 +27,8 @@ let summaryCalls = 0;
 let failSynthesis = false;
 let invalidCrossBatch = false;
 let rateLimitOnce = false;
+let omissionMode: "none" | "gradual" | "persistent" = "none";
+let omissionCalls: string[][] = [];
 app.post("/chat/completions", (req, res) => {
   assert.equal(req.get("authorization"), "Bearer long-recording-test-key");
   const text = req.body.messages[1].content;
@@ -100,6 +102,14 @@ app.post("/chat/completions", (req, res) => {
   const failedLogs = bundle.logs.filter(
     (l: { level: string }) => l.level === "error",
   );
+  let caseSteps = bundle.steps;
+  if (omissionMode !== "none") {
+    omissionCalls.push(bundle.steps.map((s: { id: string }) => s.id));
+    caseSteps =
+      omissionMode === "gradual" || omissionCalls.length === 1
+        ? bundle.steps.slice(0, 1)
+        : [];
+  }
   res.json({
     choices: [
       {
@@ -148,7 +158,7 @@ app.post("/chat/completions", (req, res) => {
                   ]
                 : []),
             ],
-            caseDescriptions: bundle.steps.map(
+            caseDescriptions: caseSteps.map(
               (s: { id: string; label: string }) => ({
                 stepId: s.id,
                 verdict: "limited",
@@ -448,6 +458,69 @@ try {
     ),
   );
   invalidCrossBatch = false;
+  // Missing verdicts must be repaired automatically without redoing accepted cases.
+  const omissionRun = structuredClone(groupedRun);
+  omissionRun.id = randomUUID();
+  omissionRun.operations = run.operations.slice(0, 3);
+  omissionRun.analysis = { status: "NONE", findings: [] };
+  omissionMode = "gradual";
+  omissionCalls = [];
+  put("run", omissionRun);
+  await analyze(omissionRun, profile.id);
+  await waitAnalysis(omissionRun);
+  assert.equal(
+    omissionRun.analysis.status,
+    "COMPLETED",
+    omissionRun.analysis.error,
+  );
+  assert.deepEqual(omissionCalls, [
+    ["step-0", "step-1", "step-2"],
+    ["step-1", "step-2"],
+    ["step-2"],
+  ]);
+  assert.equal(omissionRun.analysis.caseDescriptions?.length, 3);
+  assert.equal(omissionRun.analysis.progress?.total, 1);
+  assert.equal(omissionRun.analysis.progress?.completed, 1);
+  assert.equal(
+    omissionRun.analysis.findings.find((f) => f.title === "重复接口故障")
+      ?.evidenceIds.length,
+    20,
+  );
+
+  const persistentRun = structuredClone(omissionRun);
+  persistentRun.id = randomUUID();
+  persistentRun.analysis = { status: "NONE", findings: [] };
+  omissionMode = "persistent";
+  omissionCalls = [];
+  put("run", persistentRun);
+  await analyze(persistentRun, profile.id);
+  await waitAnalysis(persistentRun);
+  assert.equal(persistentRun.analysis.status, "FAILED");
+  assert.equal(persistentRun.analysis.progress?.completed, 0);
+  assert.equal(omissionCalls.length, 3, "遗漏补查必须有次数上限");
+  assert(persistentRun.analysis.error?.includes("自动补查后仍未返回"));
+  const partialJobId = persistentRun.analysis.jobId!;
+  const partialJob = get<{
+    batches: { partialResult?: { caseDescriptions: unknown[] } }[];
+  }>("analysis-job", partialJobId)!;
+  assert.equal(partialJob.batches[0].partialResult?.caseDescriptions.length, 1);
+  omissionMode = "gradual";
+  omissionCalls = [];
+  const resumePartialRun = get<Run>("run", persistentRun.id)!;
+  await analyze(resumePartialRun, profile.id);
+  await waitAnalysis(resumePartialRun);
+  assert.equal(
+    resumePartialRun.analysis.status,
+    "COMPLETED",
+    resumePartialRun.analysis.error,
+  );
+  assert.equal(resumePartialRun.analysis.jobId, partialJobId);
+  assert.deepEqual(omissionCalls, [["step-1", "step-2"], ["step-2"]]);
+  assert.equal(resumePartialRun.analysis.caseDescriptions?.length, 3);
+  omissionMode = "none";
+  console.log(
+    "遗漏判定：自动定向补查、有限重试、批内结果持久化及缺项续传通过。",
+  );
   failSynthesis = true;
   const fallbackRun = structuredClone(run);
   fallbackRun.id = randomUUID();

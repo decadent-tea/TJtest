@@ -8,6 +8,7 @@ import type {
 
 export const statusLabel: Record<StepStatus, string> = {
   RECORDED: "已录制，待验证",
+  RUNNING: "执行中",
   EXECUTED: "已执行，待验证",
   PASSED: "通过",
   FAILED: "失败",

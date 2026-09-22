@@ -10,7 +10,8 @@ import {
   isSuccessfulStaticAsset,
   requestProblem,
 } from "../server/evidence-quality";
-import { reportHtml } from "../server/report";
+import { reportContent } from "../shared/report-content";
+import { reportBlocks, reportHtml } from "../server/report";
 import { casesWorkbook } from "../server/export";
 import ExcelJS from "exceljs";
 import { attachmentHeader, downloadName } from "../server/download-name";
@@ -42,10 +43,16 @@ const run: Run = {
     mergedLogs: 0,
   },
 };
-const exportedName = downloadName({ ...run, project: "北斗天地", name: "矿井/设备体检" }, "cases");
+const exportedName = downloadName(
+  { ...run, project: "北斗天地", name: "矿井/设备体检" },
+  "cases",
+);
 assert.equal(exportedName, "北斗天地-矿井_设备体检-体检用例.xlsx");
 const disposition = attachmentHeader(exportedName, "cases-test.xlsx");
-assert.equal(decodeURIComponent(disposition.split("filename*=UTF-8''")[1]), exportedName);
+assert.equal(
+  decodeURIComponent(disposition.split("filename*=UTF-8''")[1]),
+  exportedName,
+);
 let sequence = 0;
 function request(patch: Partial<NetworkCall> = {}) {
   const r: NetworkCall = {
@@ -127,8 +134,20 @@ const log: LogEvent = {
 captureLog(run, { ...log, level: "debug" });
 captureLog(run, log);
 captureLog(run, { ...log, id: "log-b" });
-captureLog(run, { ...log, id: "sse-a", level: "sse", text: "[SSE /events] update", occurrences: undefined });
-captureLog(run, { ...log, id: "download-a", level: "info", text: "触发下载：report.xlsx", occurrences: undefined });
+captureLog(run, {
+  ...log,
+  id: "sse-a",
+  level: "sse",
+  text: "[SSE /events] update",
+  occurrences: undefined,
+});
+captureLog(run, {
+  ...log,
+  id: "download-a",
+  level: "info",
+  text: "触发下载：report.xlsx",
+  occurrences: undefined,
+});
 assert.equal(run.logs.length, 3);
 assert.equal(run.logs[0].occurrences, 2);
 assert.equal(run.captureStats!.requests, 13);
@@ -137,7 +156,11 @@ assert.equal(interfaceTotal(run), 10, "接口总数应排除过滤的资源和�
 assert.equal(run.captureStats!.mergedRequests, 1);
 assert.equal(run.captureStats!.logs, 5);
 assert.equal(run.captureStats!.filteredLogs, 1);
-assert.equal(consoleTotal(run), 3, "Console 总数应排除 SSE 和下载事件，但保留被过滤的普通控制台消息");
+assert.equal(
+  consoleTotal(run),
+  3,
+  "Console 总数应排除 SSE 和下载事件，但保留被过滤的普通控制台消息",
+);
 const interfaceCountBeforeStaticChunk = interfaceTotal(run);
 const staticChunk = request({
   url: "http://local.test/static/js/chunk.editor.js",
@@ -145,18 +168,27 @@ const staticChunk = request({
   category: "business",
 });
 assert.equal(isSuccessfulStaticAsset(staticChunk), true);
-assert(!run.requests.some((item) => item.id === staticChunk.id), "成功加载的静态脚本不应作为业务接口保留");
-assert.equal(interfaceTotal(run), interfaceCountBeforeStaticChunk, "动态加载的脚本不应计入接口总数");
-run.analysis.findings = [{
-  id: "ai-related-request",
-  source: "ai",
-  title: "缺少业务断言",
-  module: "设备",
-  severity: "low",
-  category: "functional",
-  detail: "操作结果缺少可观察的业务断言。",
-  evidenceIds: [first.id],
-}];
+assert(
+  !run.requests.some((item) => item.id === staticChunk.id),
+  "成功加载的静态脚本不应作为业务接口保留",
+);
+assert.equal(
+  interfaceTotal(run),
+  interfaceCountBeforeStaticChunk,
+  "动态加载的脚本不应计入接口总数",
+);
+run.analysis.findings = [
+  {
+    id: "ai-related-request",
+    source: "ai",
+    title: "缺少业务断言",
+    module: "设备",
+    severity: "low",
+    category: "functional",
+    detail: "操作结果缺少可观察的业务断言。",
+    evidenceIds: [first.id],
+  },
+];
 assert.equal(
   problemRequests(run).length,
   5,
@@ -179,6 +211,13 @@ for (const word of [
 ])
   assert(summary.includes(word));
 const html = reportHtml(run);
+const beforeContent = JSON.stringify(run);
+assert.deepEqual(
+  reportContent(run),
+  reportBlocks(structuredClone(run)),
+  "网页与下载报告正文口径一致",
+);
+assert.equal(JSON.stringify(run), beforeContent, "网页报告生成不得修改记录");
 assert(!html.includes("RESPONSE_BODY_MUST_NOT_EXPORT"));
 assert(!html.includes(huge.id));
 assert(!html.includes("page=2"));

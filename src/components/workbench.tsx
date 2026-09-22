@@ -1,9 +1,7 @@
-import {
-  finalFindings,
-  riskSummary,
-  analysisNarrative,
-} from "../../server/evidence-quality";
-import { useMemo, useState, useEffect } from "react";
+import { InspectionResult } from "./inspection-result";
+import { useUnsavedChanges } from "./unsaved-changes";
+import { finalFindings } from "../../server/evidence-quality";
+import { useMemo, useState, useEffect, useRef } from "react";
 import { toast } from "sonner";
 import {
   Pause,
@@ -11,6 +9,7 @@ import {
   Square,
   Save,
   BrainCircuit,
+  FileCheck2,
   Download,
   Flag,
   Globe2,
@@ -32,7 +31,6 @@ import {
 import { Input } from "@/components/ui/input";
 import { Field, FieldLabel, FieldGroup } from "@/components/ui/field";
 import { Badge } from "@/components/ui/badge";
-import { caseView } from "../../server/case-view";
 import {
   findingHasRelevantEvidence,
   isBelowPerformanceThreshold,
@@ -67,6 +65,7 @@ import { StateBadge, PageTitle, Blank } from "./studio";
 import { Pagination, currentPage } from "./pagination";
 import { active, time } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { actualOperations } from "@/lib/run-path";
 import { downloadName } from "../../server/download-name";
 import type {
   Run,
@@ -74,18 +73,6 @@ import type {
   NetworkCall,
   Finding,
 } from "../../shared/types";
-
-const findingCategory: Record<NonNullable<Finding["category"]>, string> = {
-  functional: "功能流程",
-  interface: "接口",
-  frontend: "前端",
-  performance: "性能观察",
-  security: "安全",
-  data: "数据",
-  usability: "易用性",
-  stability: "稳定性",
-};
-const confidenceLabel = { high: "高", medium: "中", low: "低" };
 
 export function Workbench({
   run,
@@ -98,6 +85,11 @@ export function Workbench({
   readOnly = false,
   initialTab = "network",
   onTabChange,
+  onConfigureModels,
+  focusedIssue,
+  resultView = false,
+  onOpenResult,
+  onBackToEvidence,
 }: {
   run: Run | undefined;
   models: ModelProfile[];
@@ -109,8 +101,16 @@ export function Workbench({
   readOnly?: boolean;
   initialTab?: string;
   onTabChange?: (tab: string) => void;
+  onConfigureModels?: () => void;
+  focusedIssue?: string;
+  resultView?: boolean;
+  onOpenResult?: () => void;
+  onBackToEvidence?: () => void;
 }) {
+  const focusedOnce = useRef("");
+  const [stopConfirm, setStopConfirm] = useState(false);
   const [selected, setSelected] = useState<string>();
+  const [pathOrder, setPathOrder] = useState<"desc" | "asc">("desc");
   const [tab, setTab] = useState(initialTab);
   useEffect(() => setTab(initialTab), [initialTab]);
   const changeTab = (value: string) => {
@@ -118,6 +118,17 @@ export function Workbench({
     onTabChange?.(value);
   };
   const [inspected, setInspected] = useState<NetworkCall>();
+  const originalRequest = run?.requests.find(
+    (request) => request.id === inspected?.id,
+  );
+  const requestGuard = useUnsavedChanges(
+    !!inspected &&
+      !!originalRequest &&
+      (inspected.description !== originalRequest.description ||
+        inspected.module !== originalRequest.module),
+    busy,
+    () => setInspected(undefined),
+  );
   const [filter, setFilter] = useState("");
   const [onlyStep, setOnlyStep] = useState(false);
   const [page, setPage] = useState(0);
@@ -126,8 +137,6 @@ export function Workbench({
   const [logPageSize, setLogPageSize] = useState(10);
   const [findingPage, setFindingPage] = useState(0);
   const [findingPageSize, setFindingPageSize] = useState(10);
-  const [casePage, setCasePage] = useState(0);
-  const [casePageSize, setCasePageSize] = useState(10);
   const [notePage, setNotePage] = useState(0);
   const [notePageSize, setNotePageSize] = useState(10);
   const [sceneModal, setSceneModal] = useState(false);
@@ -153,6 +162,23 @@ export function Workbench({
   ]);
   const [dialogInput, setDialogInput] = useState("");
   const operation = run?.operations.find((o) => o.id === selected);
+  const pathOperations = run ? actualOperations(run) : [];
+  const orderedPath =
+    pathOrder === "desc" ? [...pathOperations].reverse() : pathOperations;
+  const failedSteps =
+    run?.mode === "replay"
+      ? run.operations.filter((op) => op.status === "FAILED")
+      : [];
+  const failedStep = failedSteps[0];
+  const interruptionStep = run?.interruption?.stepId
+    ? run.operations.find((op) => op.id === run.interruption?.stepId)
+    : undefined;
+  const issueStep =
+    interruptionStep ||
+    failedStep ||
+    (run?.status === "INTERRUPTED" ? pathOperations.at(-1) : undefined);
+  const blockedCount =
+    run?.operations.filter((op) => op.status === "BLOCKED").length || 0;
   const requests = useMemo(
     () =>
       run?.requests.filter(
@@ -174,7 +200,6 @@ export function Workbench({
       findingHasRelevantEvidence(run, f) &&
       !isBelowPerformanceThreshold(run, f),
   );
-  const highFindings = findings.filter((finding) => finding.severity === "high");
   const downloadReport = async () => {
     if (!run || reportDownloading) return;
     setReportDownloading(true);
@@ -204,11 +229,6 @@ export function Workbench({
     findingPage,
     findings.length,
     findingPageSize,
-  );
-  const shownCasePage = currentPage(
-    casePage,
-    run?.cases.length || 0,
-    casePageSize,
   );
   const shownNotePage = currentPage(
     notePage,
@@ -241,12 +261,26 @@ export function Workbench({
       changeTab("console");
     } else changeTab("screen");
   };
+  useEffect(() => {
+    if (
+      !run ||
+      !focusedIssue ||
+      focusedOnce.current === `${run.id}/${focusedIssue}`
+    )
+      return;
+    const finding = [...run.findings, ...run.analysis.findings].find(
+      (item) => item.id === focusedIssue,
+    );
+    if (!finding) return;
+    focusedOnce.current = `${run.id}/${focusedIssue}`;
+    jump(finding);
+  }, [run, focusedIssue]);
   if (!run)
     return (
       <>
         <PageTitle
           eyebrow={readOnly ? "RECORD / DETAIL" : "RECORD / WORKBENCH"}
-          title={readOnly ? "体检记录详情" : "录制工作台"}
+          title={readOnly ? "体检记录详情" : "执行工作台"}
           description={
             readOnly
               ? "查看操作、接口、Console 与分析结果。"
@@ -269,8 +303,57 @@ export function Workbench({
       </>
     );
   const live = active(run.status);
+  if (resultView)
+    return (
+      <InspectionResult
+        run={run}
+        onBack={() => onBackToEvidence?.()}
+        onEvidence={jump}
+        onDownload={() => void downloadReport()}
+        downloading={reportDownloading}
+      />
+    );
   return (
     <>
+      <Dialog
+        open={stopConfirm}
+        onOpenChange={(open) => {
+          if (!busy) setStopConfirm(open);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>
+              {run.mode === "replay" ? "中止本次自动复检？" : "结束本次录制？"}
+            </DialogTitle>
+            <DialogDescription>
+              已采集的操作与证据会保留。
+              {run.mode === "replay"
+                ? "尚未执行的步骤将停止，已在目标系统提交的操作不会撤销。"
+                : "结束后无法继续追加录制；如果只是暂时离开，可以取消并暂停采集。"}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              disabled={busy}
+              onClick={() => setStopConfirm(false)}
+            >
+              继续当前任务
+            </Button>
+            <Button
+              variant="destructive"
+              disabled={busy || !live}
+              onClick={() => {
+                onAction("stop");
+                setStopConfirm(false);
+              }}
+            >
+              {run.mode === "replay" ? "确认中止复检" : "结束并保存证据"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       <PageTitle
         eyebrow={
           readOnly
@@ -299,7 +382,7 @@ export function Workbench({
                 <Button
                   disabled={busy}
                   variant="destructive"
-                  onClick={() => onAction("stop")}
+                  onClick={() => setStopConfirm(true)}
                 >
                   <Square data-icon="inline-start" />
                   {run.mode === "replay" ? "中止复检" : "结束录制"}
@@ -308,21 +391,15 @@ export function Workbench({
             ) : (
               <>
                 {run.mode === "record" && (
-                  <Button variant="secondary" onClick={onSaveFlow}>
+                  <Button
+                    variant="secondary"
+                    disabled={busy || live || !run.operations.length}
+                    onClick={onSaveFlow}
+                  >
                     <Save data-icon="inline-start" />
                     保存为流程
                   </Button>
                 )}
-                <Button variant="outline" asChild>
-                  <a href={`/api/runs/${run.id}/cases.xlsx`}>
-                    <Download data-icon="inline-start" />
-                    导出用例
-                  </a>
-                </Button>
-                <Button variant="feature" disabled={reportDownloading} onClick={() => void downloadReport()}>
-                  <Download data-icon="inline-start" />
-                  {reportDownloading ? "正在生成报告…" : "体检报告"}
-                </Button>
               </>
             )}
           </>
@@ -358,14 +435,18 @@ export function Workbench({
         <Alert>
           <MousePointer2 />
           <AlertTitle>
-            {run.mode === "record"
-              ? "请在已打开的 Chromium 浏览器中操作"
-              : "正在按保存的流程执行"}
+            {run.status === "PAUSED"
+              ? "采集已暂停，请先恢复录制"
+              : run.mode === "record"
+                ? "请在已打开的 Chromium 浏览器中操作"
+                : "正在按保存的流程执行"}
           </AlertTitle>
           <AlertDescription>
-            {run.mode === "record"
-              ? "这里会同步更新操作和证据。切换独立业务模块时，可以点击“新场景”标记边界。"
-              : "独立步骤失败后继续；关键步骤失败会阻塞当前场景，随后继续下一个场景。"}
+            {run.status === "PAUSED"
+              ? "暂停期间的操作不会作为正常录制步骤采集。点击“恢复录制”后继续业务流程。"
+              : run.mode === "record"
+                ? "这里会同步更新操作和证据。切换独立业务模块时，可以点击“新场景”标记边界。"
+                : "独立步骤失败后继续；关键步骤失败会阻塞当前场景，随后继续下一个场景。"}
           </AlertDescription>
         </Alert>
       )}
@@ -408,18 +489,326 @@ export function Workbench({
           </AlertDescription>
         </Alert>
       )}
+      {run.mode === "replay" &&
+        (run.status === "INTERRUPTED" || failedStep) && (
+          <Alert variant="destructive">
+            <AlertTriangle />
+            <AlertTitle>
+              {run.status === "INTERRUPTED" ? "复检已中断" : "复检步骤失败"}
+            </AlertTitle>
+            <AlertDescription>
+              <p>
+                {failedSteps.length
+                  ? `失败步骤：第 ${failedSteps.map((step) => step.sequence).join("、")} 步（共 ${failedSteps.length} 步）。`
+                  : issueStep
+                    ? `第 ${issueStep.sequence} 步：${issueStep.label}。`
+                    : "中断时没有正在执行的步骤。"}
+                {blockedCount > 0 ? ` 后续 ${blockedCount} 步未执行。` : ""}
+              </p>
+              {run.status === "INTERRUPTED" && (
+                <p>
+                  {run.interruption?.reason ||
+                    run.notes.findLast((note) => note.includes("中断")) ||
+                    "请查看步骤错误和截图。"}
+                </p>
+              )}
+              {(failedSteps.length
+                ? failedSteps
+                : issueStep
+                  ? [issueStep]
+                  : []
+              ).map((step) => (
+                <Button
+                  key={step.id}
+                  variant="outline"
+                  size="sm"
+                  className="mt-2"
+                  onClick={() => {
+                    setSelected(step.id);
+                    document
+                      .getElementById(`path-step-${step.id}`)
+                      ?.scrollIntoView({ behavior: "smooth", block: "center" });
+                  }}
+                >
+                  第 {step.sequence} 步
+                </Button>
+              ))}
+            </AlertDescription>
+          </Alert>
+        )}
+      <section
+        className="analysis-deck"
+        aria-label="AI 体检分析"
+        data-running={run.analysis.status === "RUNNING"}
+      >
+        <div className="analysis-deck-heading">
+          <div className="analysis-orbit">
+            <BrainCircuit size={25} />
+          </div>
+          <div>
+            <div className="eyebrow">INTELLIGENCE / 体检分析</div>
+            <h2>
+              {run.analysis.status === "COMPLETED"
+                ? "分析已完成，查看本次体检结论"
+                : run.analysis.status === "RUNNING"
+                  ? "正在从执行证据中识别风险"
+                  : "从执行证据，到质量结论"}
+            </h2>
+            <p>
+              {live
+                ? "结束录制或复检后，即可启动 AI 分析。"
+                : "选择模型分析本次执行，汇总风险、处置建议与测试结论。"}
+            </p>
+          </div>
+        </div>
+        <div className="analysis-controls">
+          <Select
+            value={modelId}
+            onValueChange={setModelId}
+            disabled={run.analysis.status === "RUNNING"}
+          >
+            <SelectTrigger className="w-60" aria-label="分析模型">
+              <SelectValue placeholder="选择分析模型" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectGroup>
+                {models
+                  .filter((m) => m.enabled && m.hasKey)
+                  .map((m) => (
+                    <SelectItem key={m.id} value={m.id}>
+                      {m.name} · {m.model}
+                    </SelectItem>
+                  ))}
+              </SelectGroup>
+            </SelectContent>
+          </Select>
+          <div
+            className="analysis-trigger-shell"
+            data-running={run.analysis.status === "RUNNING"}
+            data-unavailable={
+              live ||
+              !models.some((m) => m.id === modelId && m.enabled && m.hasKey)
+            }
+          >
+            <span className="analysis-particles" aria-hidden="true">
+              {Array.from({ length: 8 }, (_, index) => (
+                <i
+                  key={index}
+                  style={{ "--particle": index } as React.CSSProperties}
+                />
+              ))}
+            </span>
+            <Button
+              variant="launch"
+              className="analysis-trigger"
+              disabled={
+                live ||
+                busy ||
+                !models.some(
+                  (m) => m.id === modelId && m.enabled && m.hasKey,
+                ) ||
+                run.analysis.status === "RUNNING"
+              }
+              onClick={() => onAnalyze(modelId)}
+            >
+              <BrainCircuit data-icon="inline-start" />
+              <span>
+                {run.analysis.status === "RUNNING"
+                  ? "正在分析"
+                  : run.analysis.status === "FAILED" && run.analysis.jobId
+                    ? "继续未完成分析"
+                    : "AI 分析本次体检"}
+              </span>
+              <span className="analysis-trigger-signal" aria-hidden="true">
+                <i />
+                <i />
+                <i />
+              </span>
+            </Button>
+          </div>
+          {run.analysis.status === "COMPLETED" && (
+            <Button
+              variant="outline"
+              size="lg"
+              className="inspection-result-trigger"
+              onClick={onOpenResult}
+            >
+              <span className="result-trigger-paper" aria-hidden="true">
+                <FileCheck2 />
+              </span>
+              <span className="result-trigger-label">体检结果</span>
+              <span className="result-trigger-arrow" aria-hidden="true">
+                <ArrowUpRight />
+              </span>
+            </Button>
+          )}
+          {run.analysis.status === "RUNNING" && (
+            <Button
+              variant="outline"
+              disabled={busy}
+              onClick={() => onAction("analysis/cancel")}
+            >
+              <Square data-icon="inline-start" />
+              停止分析
+            </Button>
+          )}
+        </div>
+        {!models.some((m) => m.enabled && m.hasKey) && (
+          <Alert className="mb-4">
+            <AlertTitle>尚无可用分析模型</AlertTitle>
+            <AlertDescription>
+              添加并启用模型后可运行 AI 分析，现有证据和规则发现仍可查看。
+              <Button variant="outline" onClick={onConfigureModels}>
+                配置分析模型
+              </Button>
+            </AlertDescription>
+          </Alert>
+        )}
+        {run.analysis.status === "RUNNING" && (
+          <div className="analysis-live-scan" role="status">
+            <div className="analysis-wave" aria-hidden="true">
+              {Array.from({ length: 24 }, (_, index) => (
+                <i
+                  key={index}
+                  style={{ "--bar": index } as React.CSSProperties}
+                />
+              ))}
+            </div>
+            <div>
+              <strong>
+                {run.analysis.progress?.phase === "summary"
+                  ? "正在汇总结论"
+                  : "正在分析执行证据"}
+              </strong>
+              <p>
+                {run.analysis.activity?.label ||
+                  "正在处理接口、日志与操作路径，请稍候…"}
+              </p>
+            </div>
+            <span className="analysis-live-dot" />
+          </div>
+        )}
+        {run.analysis.progress && run.analysis.status !== "COMPLETED" && (
+          <div className="analysis-summary" role="status" aria-live="polite">
+            <h3>
+              {run.analysis.status === "RUNNING"
+                ? run.analysis.progress.phase === "summary"
+                  ? "证据分析完成，正在汇总体检报告"
+                  : "正在分批分析体检证据"
+                : "证据分析进度"}
+            </h3>
+            <div
+              className="analysis-progress"
+              role="progressbar"
+              aria-label="已完成证据批次"
+              aria-valuemin={0}
+              aria-valuemax={Math.max(1, run.analysis.progress.total)}
+              aria-valuenow={run.analysis.progress.completed}
+            >
+              <div
+                style={{
+                  width: `${Math.min(100, (run.analysis.progress.completed / Math.max(1, run.analysis.progress.total)) * 100)}%`,
+                }}
+              />
+            </div>
+            <p className="small-muted">
+              已完成 {run.analysis.progress.completed} /{" "}
+              {run.analysis.progress.total} 批 · 已处理{" "}
+              {run.analysis.progress.processedRecords} /{" "}
+              {run.analysis.progress.totalRecords} 条证据
+              {run.analysis.progress.resumed && " · 已恢复之前完成的批次"}
+            </p>
+            {run.analysis.status === "RUNNING" &&
+              !!run.analysis.activeRequests?.length && (
+                <div className="analysis-activity-list">
+                  {run.analysis.activeRequests.map((request) => (
+                    <div key={`${request.batch}-${request.requestStartedAt}`}>
+                      <strong>{request.label}</strong>
+                      <span>
+                        本次请求已等待{" "}
+                        {Math.max(
+                          0,
+                          Math.floor(
+                            (Date.now() -
+                              Date.parse(request.requestStartedAt)) /
+                              1000,
+                          ),
+                        )}{" "}
+                        秒 · 第 {request.attempt} 次尝试 · 已接收{" "}
+                        {request.receivedCharacters} 字符
+                        {request.reasoningCharacters > 0
+                          ? ` · 思考输出 ${request.reasoningCharacters} 字符`
+                          : ""}
+                      </span>
+                      {request.lastError && <span>{request.lastError}</span>}
+                    </div>
+                  ))}
+                </div>
+              )}
+            {run.analysis.coverage && (
+              <small>
+                覆盖 {run.analysis.coverage.steps} 个步骤、
+                {run.analysis.coverage.requests} 次接口调用、
+                {run.analysis.coverage.logs} 条日志。
+                静态资源在采集入口过滤，不发送给 AI；长正文采用摘要。
+                {run.analysis.coverage.analysisRecords !== undefined &&
+                  ` 合并后 ${run.analysis.coverage.analysisRecords} 项分析证据，减少 ${run.analysis.coverage.groupedRecords || 0} 条重复/同类输入。`}
+              </small>
+            )}
+          </div>
+        )}
+        {!!run.analysis.warnings?.length && (
+          <Alert>
+            <AlertTriangle />
+            <AlertTitle>分析说明</AlertTitle>
+            <AlertDescription>
+              {run.analysis.warnings.map((warning, index) => (
+                <p key={index}>{warning}</p>
+              ))}
+            </AlertDescription>
+          </Alert>
+        )}
+        {run.analysis.error && (
+          <Alert variant="destructive">
+            <AlertTriangle />
+            <AlertTitle>AI 分析未完成</AlertTitle>
+            <AlertDescription>{run.analysis.error}</AlertDescription>
+          </Alert>
+        )}
+      </section>
       <div className="workbench-grid">
         <Card className="timeline-card">
           <CardHeader>
             <CardTitle>操作路径</CardTitle>
-            <CardDescription>{run.scene} · 按发生顺序记录</CardDescription>
+            <CardDescription>
+              {run.mode === "replay"
+                ? `本次实际尝试 ${pathOperations.length} 步${run.operations.length > pathOperations.length ? ` · ${run.operations.length - pathOperations.length} 步未执行` : ""}`
+                : `${run.scene} · 按发生顺序记录`}
+            </CardDescription>
+            <CardAction>
+              <Select
+                value={pathOrder}
+                onValueChange={(value) => setPathOrder(value as "desc" | "asc")}
+              >
+                <SelectTrigger aria-label="操作路径排序" className="w-24">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    <SelectItem value="desc">逆序</SelectItem>
+                    <SelectItem value="asc">顺序</SelectItem>
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+            </CardAction>
           </CardHeader>
           <CardContent>
             <div className="timeline">
-              {run.operations.length ? (
-                run.operations.map((op, i) => (
+              {orderedPath.length ? (
+                orderedPath.map((op) => (
                   <button
                     key={op.id}
+                    id={`path-step-${op.id}`}
                     onClick={() => {
                       setSelected(op.id);
                       setInspected(undefined);
@@ -435,7 +824,7 @@ export function Workbench({
                         op.status === "FAILED" && "failed-index",
                       )}
                     >
-                      {i + 1}
+                      {op.sequence}
                     </span>
                     <span className="step-copy">
                       <strong>{op.label}</strong>
@@ -519,7 +908,7 @@ export function Workbench({
                   </TabsTrigger>
                   <TabsTrigger value="report">
                     <BrainCircuit />
-                    分析与用例
+                    风险 {findings.length}
                   </TabsTrigger>
                 </TabsList>
                 <TabsContent value="network">
@@ -730,182 +1119,6 @@ export function Workbench({
                   )}
                 </TabsContent>
                 <TabsContent value="report">
-                  <div className="analysis-controls">
-                    <Select
-                      value={modelId}
-                      onValueChange={setModelId}
-                      disabled={run.analysis.status === "RUNNING"}
-                    >
-                      <SelectTrigger className="w-60">
-                        <SelectValue placeholder="选择分析模型" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectGroup>
-                          {models
-                            .filter((m) => m.enabled && m.hasKey)
-                            .map((m) => (
-                              <SelectItem key={m.id} value={m.id}>
-                                {m.name} · {m.model}
-                              </SelectItem>
-                            ))}
-                        </SelectGroup>
-                      </SelectContent>
-                    </Select>
-                    <Button
-                      disabled={
-                        live ||
-                        busy ||
-                        !modelId ||
-                        run.analysis.status === "RUNNING"
-                      }
-                      onClick={() => onAnalyze(modelId)}
-                    >
-                      <BrainCircuit data-icon="inline-start" />
-                      {run.analysis.status === "RUNNING"
-                        ? "正在分析"
-                        : run.analysis.status === "FAILED" && run.analysis.jobId
-                          ? "继续未完成分析"
-                          : "AI 分析本次体检"}
-                    </Button>
-                    {run.analysis.status === "RUNNING" && (
-                      <Button
-                        variant="outline"
-                        disabled={busy}
-                        onClick={() => onAction("analysis/cancel")}
-                      >
-                        <Square data-icon="inline-start" />
-                        停止分析
-                      </Button>
-                    )}
-                  </div>
-                  <p className="small-muted mb-4">
-                    结束录制或复检后，手动点击分析。需先在系统维护配置模型。AI 合并重复证据后最多并行分析 3
-                    批，并按业务流程、接口链路、前端异常和数据风险生成带事实、影响、复现、原因、处置及验证建议的报告。原始记录全部保留；不可用时，规则发现和执行用例仍可查看。
-                  </p>
-                  {run.analysis.progress && (
-                    <div
-                      className="analysis-summary"
-                      role="status"
-                      aria-live="polite"
-                    >
-                      <h3>
-                        {run.analysis.status === "RUNNING"
-                          ? run.analysis.progress.phase === "summary"
-                            ? "证据分析完成，正在汇总体检报告"
-                            : "正在分批分析体检证据"
-                          : "证据分析进度"}
-                      </h3>
-                      <div
-                        className="analysis-progress"
-                        role="progressbar"
-                        aria-label="已完成证据批次"
-                        aria-valuemin={0}
-                        aria-valuemax={Math.max(1, run.analysis.progress.total)}
-                        aria-valuenow={run.analysis.progress.completed}
-                      >
-                        <div
-                          style={{
-                            width: `${Math.min(100, (run.analysis.progress.completed / Math.max(1, run.analysis.progress.total)) * 100)}%`,
-                          }}
-                        />
-                      </div>
-                      <p className="small-muted">
-                        已完成 {run.analysis.progress.completed} /{" "}
-                        {run.analysis.progress.total} 批 · 已处理{" "}
-                        {run.analysis.progress.processedRecords} /{" "}
-                        {run.analysis.progress.totalRecords} 条证据
-                        {run.analysis.progress.resumed &&
-                          " · 已恢复之前完成的批次"}
-                      </p>
-                      {run.analysis.status === "RUNNING" &&
-                        !!run.analysis.activeRequests?.length && (
-                          <div className="analysis-activity-list">
-                            {run.analysis.activeRequests.map((request) => (
-                              <div
-                                key={`${request.batch}-${request.requestStartedAt}`}
-                              >
-                                <strong>{request.label}</strong>
-                                <span>
-                                  本次请求已等待{" "}
-                                  {Math.max(
-                                    0,
-                                    Math.floor(
-                                      (Date.now() -
-                                        Date.parse(request.requestStartedAt)) /
-                                        1000,
-                                    ),
-                                  )}{" "}
-                                  秒 · 第 {request.attempt} 次尝试 · 已接收{" "}
-                                  {request.receivedCharacters} 字符
-                                  {request.reasoningCharacters > 0
-                                    ? ` · 思考输出 ${request.reasoningCharacters} 字符`
-                                    : ""}
-                                </span>
-                                {request.lastError && (
-                                  <span>{request.lastError}</span>
-                                )}
-                              </div>
-                            ))}
-                          </div>
-                        )}
-                      {run.analysis.coverage && (
-                        <small>
-                          覆盖 {run.analysis.coverage.steps} 个步骤、
-                          {run.analysis.coverage.requests} 次接口调用、
-                          {run.analysis.coverage.logs} 条日志。
-                          静态资源在采集入口过滤，不发送给 AI；长正文采用摘要。
-                          {run.analysis.coverage.analysisRecords !==
-                            undefined &&
-                            ` 合并后 ${run.analysis.coverage.analysisRecords} 项分析证据，减少 ${run.analysis.coverage.groupedRecords || 0} 条重复/同类输入。`}
-                        </small>
-                      )}
-                    </div>
-                  )}
-                  {!!run.analysis.warnings?.length && (
-                    <Alert>
-                      <AlertTriangle />
-                      <AlertTitle>分析说明</AlertTitle>
-                      <AlertDescription>
-                        {run.analysis.warnings.map((warning, index) => (
-                          <p key={index}>{warning}</p>
-                        ))}
-                      </AlertDescription>
-                    </Alert>
-                  )}
-                  {run.analysis.error && (
-                    <Alert variant="destructive">
-                      <AlertTriangle />
-                      <AlertTitle>AI 分析未完成</AlertTitle>
-                      <AlertDescription>{run.analysis.error}</AlertDescription>
-                    </Alert>
-                  )}
-                  {run.analysis.summary && (
-                    <div className="analysis-summary">
-                      <h3>AI 分析摘要</h3>
-                      <p>{riskSummary(run)}</p>
-                      <p>{analysisNarrative(run)}</p>
-                      {!!highFindings.length && (
-                        <div className="high-risk-summary">
-                          <h4>高风险内容</h4>
-                          <ol>
-                            {highFindings.map((finding) => (
-                              <li key={finding.id}>
-                                <strong>{finding.title}</strong>
-                                <span>{finding.module}</span>
-                                <p>{finding.observation || finding.detail}</p>
-                                {finding.impact && <p>业务影响：{finding.impact}</p>}
-                                {finding.suggestion && <p>处置建议：{finding.suggestion}</p>}
-                              </li>
-                            ))}
-                          </ol>
-                        </div>
-                      )}
-                      <small>
-                        {run.analysis.provider} / {run.analysis.model} ·{" "}
-                        {time(run.analysis.generatedAt)}
-                      </small>
-                    </div>
-                  )}
                   <div className="section-line">
                     <h3>风险问题</h3>
                     <Badge variant="secondary">{findings.length}</Badge>
@@ -933,70 +1146,9 @@ export function Workbench({
                           </Button>
                         </div>
                         <small>{f.module}</small>
-                        {f.category && (
-                          <div className="finding-meta">
-                            <Badge variant="secondary">
-                              {findingCategory[f.category]}
-                            </Badge>
-                            {f.confidence && (
-                              <span>
-                                结论置信度：{confidenceLabel[f.confidence]}
-                              </span>
-                            )}
-                          </div>
-                        )}
-                        {f.observation ? (
-                          <div className="finding-detail-grid">
-                            <section>
-                              <h4>观察事实</h4>
-                              <p>{f.observation}</p>
-                            </section>
-                            <section>
-                              <h4>业务影响</h4>
-                              <p>{f.impact}</p>
-                            </section>
-                            <section>
-                              <h4>复现路径</h4>
-                              {f.reproductionSteps?.length ? (
-                                <ol>
-                                  {f.reproductionSteps.map((step, index) => (
-                                    <li key={index}>{step}</li>
-                                  ))}
-                                </ol>
-                              ) : (
-                                <p>请通过“定位证据”查看关联操作。</p>
-                              )}
-                            </section>
-                            <section>
-                              <h4>原因判断</h4>
-                              <p>{f.possibleCause}</p>
-                            </section>
-                            <section>
-                              <h4>处置建议</h4>
-                              <p>{f.suggestion}</p>
-                            </section>
-                            <section>
-                              <h4>验证建议</h4>
-                              {f.validationSteps?.length ? (
-                                <ol>
-                                  {f.validationSteps.map((step, index) => (
-                                    <li key={index}>{step}</li>
-                                  ))}
-                                </ol>
-                              ) : (
-                                <p>结合关联证据和业务预期补充断言。</p>
-                              )}
-                            </section>
-                          </div>
-                        ) : (
-                          <>
-                            <p>{f.detail}</p>
-                            {f.suggestion && (
-                              <p className="small-muted">
-                                建议：{f.suggestion}
-                              </p>
-                            )}
-                          </>
+                        <p>{f.observation || f.detail}</p>
+                        {f.suggestion && (
+                          <p className="small-muted">建议：{f.suggestion}</p>
                         )}
                       </div>
                     ))}
@@ -1015,63 +1167,6 @@ export function Workbench({
                       未发现规则命中的异常；不代表业务功能全部通过。
                     </p>
                   )}
-                  <div className="section-line">
-                    <h3>本次执行用例</h3>
-                    <span className="small-muted">
-                      通过表示本步操作目标达成
-                    </span>
-                  </div>
-                  <Table>
-                    <TableHeader>
-                      <TableRow>
-                        <TableHead>操作</TableHead>
-                        <TableHead>接口 / Console</TableHead>
-                        <TableHead>是否通过</TableHead>
-                        <TableHead>问题描述 / 解决方案</TableHead>
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {run.cases
-                        .slice(
-                          shownCasePage * casePageSize,
-                          (shownCasePage + 1) * casePageSize,
-                        )
-                        .map((c) => {
-                          const view = caseView(run, c);
-                          return (
-                            <TableRow key={c.id}>
-                              <TableCell>
-                                <strong>{c.title}</strong>
-                                <p>{view.operation}</p>
-                              </TableCell>
-                              <TableCell>
-                                <p>{view.interface}</p>
-                                <p className="small-muted">{view.console}</p>
-                              </TableCell>
-                              <TableCell>
-                                <Badge variant="outline">{view.result}</Badge>
-                              </TableCell>
-                              <TableCell>
-                                <p>{view.problem}</p>
-                                <p className="small-muted">
-                                  建议：{view.solution}
-                                </p>
-                              </TableCell>
-                            </TableRow>
-                          );
-                        })}
-                    </TableBody>
-                  </Table>
-                  <Pagination
-                    total={run.cases.length}
-                    page={shownCasePage}
-                    pageSize={casePageSize}
-                    onPageChange={setCasePage}
-                    onPageSizeChange={(size) => {
-                      setCasePageSize(size);
-                      setCasePage(0);
-                    }}
-                  />
                 </TabsContent>
               </Tabs>
             </CardContent>
@@ -1137,7 +1232,7 @@ export function Workbench({
       <Dialog
         open={!!inspected}
         onOpenChange={(open) => {
-          if (!open) setInspected(undefined);
+          if (!open) requestGuard.requestClose();
         }}
       >
         <DialogContent className="sm:max-w-4xl max-h-[85vh] overflow-y-auto">
@@ -1157,6 +1252,7 @@ export function Workbench({
                   </FieldLabel>
                   <Input
                     id="request-description"
+                    disabled={busy}
                     value={inspected.description}
                     onChange={(event) =>
                       setInspected({
@@ -1172,6 +1268,7 @@ export function Workbench({
                   </FieldLabel>
                   <Input
                     id="request-module"
+                    disabled={busy}
                     value={inspected.module}
                     onChange={(event) =>
                       setInspected({ ...inspected, module: event.target.value })
@@ -1247,6 +1344,7 @@ export function Workbench({
           )}
         </DialogContent>
       </Dialog>
+      {requestGuard.confirmation}
     </>
   );
 }

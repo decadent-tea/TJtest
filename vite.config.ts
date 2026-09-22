@@ -11,7 +11,6 @@ export default defineConfig({
     proxy: {
       "/api": "http://127.0.0.1:4318",
       "/artifacts": "http://127.0.0.1:4318",
-      "/demo": "http://127.0.0.1:4318",
     },
   },
 });

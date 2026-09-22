@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Separator } from "@/components/ui/separator";
 import { TraceMap } from "@/components/trace-map";
 import {
@@ -100,15 +101,46 @@ export function RunTable({
   runs,
   onOpen,
   actions,
+  selection,
 }: {
   runs: Summary[];
   onOpen: (id: string) => void;
   actions?: (run: Summary) => ReactNode;
+  selection?: {
+    ids: Set<string>;
+    disabled: boolean;
+    onChange: (ids: string[], checked: boolean) => void;
+  };
 }) {
+  const selectable = runs.filter((run) => !active(run.status));
+  const selectedCount = selectable.filter((run) =>
+    selection?.ids.has(run.id),
+  ).length;
   return (
     <Table>
       <TableHeader>
         <TableRow>
+          {selection && (
+            <TableHead className="w-12">
+              <Checkbox
+                aria-label="全选当前页可归档记录"
+                disabled={selection.disabled || !selectable.length}
+                checked={
+                  selectedCount === selectable.length && selectable.length > 0
+                    ? true
+                    : selectedCount > 0
+                      ? "indeterminate"
+                      : false
+                }
+                onCheckedChange={(checked) =>
+                  selection.onChange(
+                    selectable.map((run) => run.id),
+                    checked === true,
+                  )
+                }
+              />
+            </TableHead>
+          )}
           <TableHead>体检任务</TableHead>
           <TableHead>模式 / 环境</TableHead>
           <TableHead>状态</TableHead>
@@ -124,8 +156,21 @@ export function RunTable({
           <TableRow
             key={run.id}
             className="cursor-pointer"
+            data-state={selection?.ids.has(run.id) ? "selected" : undefined}
             onClick={() => onOpen(run.id)}
           >
+            {selection && (
+              <TableCell onClick={(event) => event.stopPropagation()}>
+                <Checkbox
+                  aria-label={`选择${run.name}`}
+                  disabled={selection.disabled || active(run.status)}
+                  checked={selection.ids.has(run.id)}
+                  onCheckedChange={(checked) =>
+                    selection.onChange([run.id], checked === true)
+                  }
+                />
+              </TableCell>
+            )}
             <TableCell>
               <Button
                 variant="link"
@@ -152,7 +197,7 @@ export function RunTable({
               </div>
               <div className="small-muted">
                 {run.issueCount > 0 ? (
-                  <span className="issue-text">{run.issueCount} 项待处理</span>
+                  <span className="issue-text">{run.issueCount} 项问题</span>
                 ) : (
                   "暂无规则异常"
                 )}
@@ -193,7 +238,7 @@ export function Overview({
 }: {
   runs: Summary[];
   flows: Flow[];
-  onNew: (demo?: boolean) => void;
+  onNew: () => void;
   onOpen: (id: string) => void;
   onPage: (page: string) => void;
 }) {
@@ -220,7 +265,7 @@ export function Overview({
       title: "规则发现",
       label: "FINDINGS",
       value: completed.reduce((n, r) => n + r.issueCount, 0),
-      page: "issues",
+      page: "history",
     },
   ];
   return (
@@ -363,17 +408,9 @@ export function Overview({
             </li>
           </ol>
           <Button variant="outline" onClick={() => onPage("settings")}>
-            前往系统维护
+            配置分析模型
             <ArrowUpRight data-icon="inline-end" />
           </Button>
-          <Separator />
-          <div className="demo-entry">
-            <span>第一次使用？</span>
-            <Button variant="link" size="sm" onClick={() => onNew(true)}>
-              体验演示工程
-              <ArrowRight data-icon="inline-end" />
-            </Button>
-          </div>
         </aside>
       </motion.div>
     </div>

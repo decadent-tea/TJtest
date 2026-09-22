@@ -17,6 +17,7 @@ const fixture = (id: string, patch: Partial<Run> = {}): Run => ({
 put("run", fixture("archive-delete", { analysis: { status: "NONE", findings: [], jobId: "legacy-job" } }));
 put("run", fixture("archive-keep"));
 put("run", fixture("history", { archived: false }));
+put("run", fixture("history-second", { archived: false }));
 put("analysis-job", { id: "legacy-job" });
 put("analysis-job", { id: "earlier-job", runId: "archive-delete" });
 put("analysis-job", { id: "keep-job", runId: "archive-keep" });
@@ -45,13 +46,30 @@ try {
   await page.goto(`${base}/#history`);
   const historyNav = page.locator(".sidebar").getByRole("button", { name: /体检记录/ });
   await page.getByRole("button", { name: "history", exact: true }).waitFor();
-  assert.equal(await historyNav.locator(".nav-count").textContent(), "1");
-  await page.getByRole("button", { name: "归档记录", exact: true }).click();
+  assert.equal(await historyNav.locator(".nav-count").textContent(), "2");
+  assert.equal(await page.getByRole("button", { name: "归档记录", exact: true }).count(), 0);
+  assert(await page.getByRole("button", { name: "归档", exact: true }).isEnabled());
+  await page.getByRole("button", { name: "归档", exact: true }).click();
+  await page.getByText("请先选择要归档的记录。", { exact: true }).waitFor();
+  assert.equal(get<Run>("run", "history")?.archived, false);
+  await page.getByRole("checkbox", { name: "选择history", exact: true }).check();
+  assert(page.url().endsWith("#history"), "勾选不能跳转详情");
+  assert.equal(await page.getByRole("checkbox", { name: "全选当前页可归档记录" }).getAttribute("aria-checked"), "mixed");
+  await page.getByRole("checkbox", { name: "全选当前页可归档记录" }).check();
+  await page.screenshot({ path: resolve(dataRoot, "batch-selected.png"), fullPage: true });
+  await page.getByRole("button", { name: "归档（2）", exact: true }).click();
   await page.getByText("暂无匹配记录", { exact: true }).waitFor();
+  assert(await page.getByRole("button", { name: "归档", exact: true }).isEnabled());
+  assert(get<Run>("run", "history")?.archived);
+  assert(get<Run>("run", "history-second")?.archived);
+  await fetch(`${base}/api/runs/history/archive`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ archived: true }),
+  });
+  assert(get<Run>("run", "history")?.archived, "重试归档不能把记录移出归档");
   assert.equal(await historyNav.locator(".nav-count").count(), 0);
-  await page.locator(".sidebar").getByRole("button", { name: "历史档案" }).click();
+  await page.getByRole("button", { name: /^已归档（/ }).click();
   await page.getByRole("button", { name: "archive-delete", exact: true }).waitFor();
-  assert.equal(await page.locator("tbody tr").count(), 3);
+  assert.equal(await page.locator("tbody tr").count(), 4);
   assert.equal(await page.getByText("archive-delete", { exact: true }).count(), 1);
   const row = page.locator("tbody tr").filter({ hasText: "archive-delete" });
   await row.getByRole("button", { name: "彻底删除", exact: true }).click();

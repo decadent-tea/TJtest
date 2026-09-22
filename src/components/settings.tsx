@@ -1,3 +1,4 @@
+import { useUnsavedChanges } from "./unsaved-changes";
 import { useState } from "react";
 import {
   BrainCircuit,
@@ -63,8 +64,8 @@ export function Settings({
     <>
       <PageTitle
         eyebrow="SYSTEM / MAINTENANCE"
-        title="系统维护"
-        description="配置分析模型，查看本机执行与数据存储状态。"
+        title="模型与设置"
+        description="配置分析模型，了解本机执行方式与证据存储规则。"
       />
       <Card>
         <CardHeader>
@@ -131,7 +132,7 @@ export function Settings({
           ) : (
             <Blank
               title="接入你的第一个分析模型"
-              description="添加服务地址、API Key 和模型名称，保存后测试连接，再到体检工作台发起分析。"
+              description="添加服务地址、API Key 和模型名称，保存后测试连接，再到体检记录的“分析与用例”发起分析。"
               action={
                 <Button variant="outline" onClick={() => onEdit()}>
                   添加模型配置
@@ -241,176 +242,221 @@ export function ModelEditor({
           maxTokens: 4096,
         },
   );
+  const initial = profile
+    ? { ...profile, apiKey: "" }
+    : {
+        id: "",
+        name: "",
+        provider: "DeepSeek",
+        baseUrl: endpoints.DeepSeek,
+        model: "",
+        apiKey: "",
+        enabled: true,
+        timeout: 90,
+        maxTokens: 4096,
+      };
+  const { requestClose, confirmation } = useUnsavedChanges(
+    JSON.stringify(draft) !== JSON.stringify(initial),
+    busy,
+    onClose,
+  );
   return (
-    <Dialog
-      open
-      onOpenChange={(open) => {
-        if (!open) onClose();
-      }}
-    >
-      <DialogContent className="sm:max-w-xl">
-        <DialogHeader>
-          <DialogTitle>{profile ? "编辑模型配置" : "添加分析模型"}</DialogTitle>
-          <DialogDescription>
-            模型名称按服务商实际提供的 ID 填写。保存后可测试连接。
-          </DialogDescription>
-        </DialogHeader>
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            onSave(draft);
-          }}
-        >
-          <FieldGroup>
-            <FieldGroup className="grid grid-cols-2 gap-4">
-              <Field>
-                <FieldLabel htmlFor="model-name">配置名称</FieldLabel>
-                <Input
-                  id="model-name"
-                  required
-                  value={draft.name}
-                  onChange={(e) => setDraft({ ...draft, name: e.target.value })}
-                  placeholder="例如：团队分析模型"
-                />
-              </Field>
-              <Field>
-                <FieldLabel>服务商</FieldLabel>
-                <Select
-                  value={draft.provider}
-                  onValueChange={(v) =>
-                    setDraft({
-                      ...draft,
-                      provider: v as ModelProfile["provider"],
-                      baseUrl: endpoints[v as ModelProfile["provider"]],
-                    })
-                  }
-                >
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectGroup>
-                      {Object.keys(endpoints).map((p) => (
-                        <SelectItem key={p} value={p}>
-                          {p}
-                        </SelectItem>
-                      ))}
-                    </SelectGroup>
-                  </SelectContent>
-                </Select>
-              </Field>
-            </FieldGroup>
-            <Field>
-              <FieldLabel htmlFor="model-url">Base URL</FieldLabel>
-              <Input
-                id="model-url"
-                type="url"
-                required
-                value={draft.baseUrl}
-                onChange={(e) =>
-                  setDraft({ ...draft, baseUrl: e.target.value })
-                }
-              />
-              <FieldDescription>
-                填写兼容接口的基础地址，不包括 /chat/completions。
-              </FieldDescription>
-            </Field>
-            <Field>
-              <FieldLabel htmlFor="model-key">API Key</FieldLabel>
-              <Input
-                id="model-key"
-                type="password"
-                autoComplete="new-password"
-                required={!profile?.hasKey}
-                value={draft.apiKey || ""}
-                onChange={(e) => setDraft({ ...draft, apiKey: e.target.value })}
-                placeholder={
-                  profile?.hasKey ? "留空保留原密钥" : "仅在后端加密保存"
-                }
-              />
-            </Field>
-            <Field>
-              <FieldLabel htmlFor="model-id">模型 ID</FieldLabel>
-              <Input
-                id="model-id"
-                required
-                value={draft.model}
-                onChange={(e) => setDraft({ ...draft, model: e.target.value })}
-                placeholder="填写你账号可调用的模型名称"
-              />
-            </Field>
-            <FieldGroup className="grid grid-cols-2 gap-4">
-              <Field>
-                <FieldLabel htmlFor="model-timeout">超时（秒）</FieldLabel>
-                <Input
-                  id="model-timeout"
-                  required
-                  type="number"
-                  min={5}
-                  max={300}
-                  value={draft.timeout}
-                  onChange={(e) =>
-                    setDraft({ ...draft, timeout: Number(e.target.value) })
-                  }
-                />
-              </Field>
-              <Field>
-                <FieldLabel htmlFor="model-tokens">最大输出 Token</FieldLabel>
-                <Input
-                  id="model-tokens"
-                  required
-                  type="number"
-                  min={100}
-                  max={32000}
-                  value={draft.maxTokens}
-                  onChange={(e) =>
-                    setDraft({ ...draft, maxTokens: Number(e.target.value) })
-                  }
-                />
-              </Field>
-            </FieldGroup>
-            {draft.provider === "Qwen" && (
-              <Field orientation="horizontal">
-                <FieldLabel htmlFor="model-thinking">Qwen 思考模式</FieldLabel>
-                <Switch
-                  id="model-thinking"
-                  checked={draft.thinking ?? false}
-                  onCheckedChange={(thinking) =>
-                    setDraft({ ...draft, thinking })
-                  }
-                />
-              </Field>
-            )}
-            {draft.provider === "Qwen" && (
-              <FieldDescription>
-                支持该参数的 Qwen
-                混合思考模型默认关闭思考，减少批量分析等待；开启会增加时间和
-                Token 消耗。
-              </FieldDescription>
-            )}
-            <FieldDescription>
-              体检结束后可在“分析与用例”中手动选择模型并启动分析；分析过程中可随时停止。汇总仅使用精简的问题信息，避免重复发送原始证据。
-            </FieldDescription>
-            <Field orientation="horizontal">
-              <FieldLabel htmlFor="model-enabled">启用该模型</FieldLabel>
-              <Switch
-                id="model-enabled"
-                checked={draft.enabled}
-                onCheckedChange={(enabled) => setDraft({ ...draft, enabled })}
-              />
-            </Field>
-          </FieldGroup>
-          <DialogFooter className="mt-6">
-            <Button type="button" variant="outline" onClick={onClose}>
-              取消
-            </Button>
-            <Button type="submit" disabled={busy}>
-              <Save data-icon="inline-start" />
-              保存模型配置
-            </Button>
-          </DialogFooter>
-        </form>
-      </DialogContent>
-    </Dialog>
+    <>
+      <Dialog
+        open
+        onOpenChange={(open) => {
+          if (!open) requestClose();
+        }}
+      >
+        <DialogContent className="sm:max-w-xl">
+          <DialogHeader>
+            <DialogTitle>
+              {profile ? "编辑模型配置" : "添加分析模型"}
+            </DialogTitle>
+            <DialogDescription>
+              模型名称按服务商实际提供的 ID 填写。保存后可测试连接。
+            </DialogDescription>
+          </DialogHeader>
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              onSave(draft);
+            }}
+          >
+            <fieldset disabled={busy} className="contents">
+              <FieldGroup>
+                <FieldGroup className="grid grid-cols-2 gap-4">
+                  <Field>
+                    <FieldLabel htmlFor="model-name">配置名称</FieldLabel>
+                    <Input
+                      id="model-name"
+                      required
+                      value={draft.name}
+                      onChange={(e) =>
+                        setDraft({ ...draft, name: e.target.value })
+                      }
+                      placeholder="例如：团队分析模型"
+                    />
+                  </Field>
+                  <Field>
+                    <FieldLabel>服务商</FieldLabel>
+                    <Select
+                      value={draft.provider}
+                      onValueChange={(v) =>
+                        setDraft({
+                          ...draft,
+                          provider: v as ModelProfile["provider"],
+                          baseUrl: endpoints[v as ModelProfile["provider"]],
+                        })
+                      }
+                    >
+                      <SelectTrigger>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectGroup>
+                          {Object.keys(endpoints).map((p) => (
+                            <SelectItem key={p} value={p}>
+                              {p}
+                            </SelectItem>
+                          ))}
+                        </SelectGroup>
+                      </SelectContent>
+                    </Select>
+                  </Field>
+                </FieldGroup>
+                <Field>
+                  <FieldLabel htmlFor="model-url">Base URL</FieldLabel>
+                  <Input
+                    id="model-url"
+                    type="url"
+                    required
+                    value={draft.baseUrl}
+                    onChange={(e) =>
+                      setDraft({ ...draft, baseUrl: e.target.value })
+                    }
+                  />
+                  <FieldDescription>
+                    填写兼容接口的基础地址，不包括 /chat/completions。
+                  </FieldDescription>
+                </Field>
+                <Field>
+                  <FieldLabel htmlFor="model-key">API Key</FieldLabel>
+                  <Input
+                    id="model-key"
+                    type="password"
+                    autoComplete="new-password"
+                    required={!profile?.hasKey}
+                    value={draft.apiKey || ""}
+                    onChange={(e) =>
+                      setDraft({ ...draft, apiKey: e.target.value })
+                    }
+                    placeholder={
+                      profile?.hasKey ? "留空保留原密钥" : "仅在后端加密保存"
+                    }
+                  />
+                </Field>
+                <Field>
+                  <FieldLabel htmlFor="model-id">模型 ID</FieldLabel>
+                  <Input
+                    id="model-id"
+                    required
+                    value={draft.model}
+                    onChange={(e) =>
+                      setDraft({ ...draft, model: e.target.value })
+                    }
+                    placeholder="填写你账号可调用的模型名称"
+                  />
+                </Field>
+                <FieldGroup className="grid grid-cols-2 gap-4">
+                  <Field>
+                    <FieldLabel htmlFor="model-timeout">超时（秒）</FieldLabel>
+                    <Input
+                      id="model-timeout"
+                      required
+                      type="number"
+                      min={5}
+                      max={300}
+                      value={draft.timeout}
+                      onChange={(e) =>
+                        setDraft({ ...draft, timeout: Number(e.target.value) })
+                      }
+                    />
+                  </Field>
+                  <Field>
+                    <FieldLabel htmlFor="model-tokens">
+                      最大输出 Token
+                    </FieldLabel>
+                    <Input
+                      id="model-tokens"
+                      required
+                      type="number"
+                      min={100}
+                      max={32000}
+                      value={draft.maxTokens}
+                      onChange={(e) =>
+                        setDraft({
+                          ...draft,
+                          maxTokens: Number(e.target.value),
+                        })
+                      }
+                    />
+                  </Field>
+                </FieldGroup>
+                {draft.provider === "Qwen" && (
+                  <Field orientation="horizontal">
+                    <FieldLabel htmlFor="model-thinking">
+                      Qwen 思考模式
+                    </FieldLabel>
+                    <Switch
+                      id="model-thinking"
+                      checked={draft.thinking ?? false}
+                      onCheckedChange={(thinking) =>
+                        setDraft({ ...draft, thinking })
+                      }
+                    />
+                  </Field>
+                )}
+                {draft.provider === "Qwen" && (
+                  <FieldDescription>
+                    支持该参数的 Qwen
+                    混合思考模型默认关闭思考，减少批量分析等待；开启会增加时间和
+                    Token 消耗。
+                  </FieldDescription>
+                )}
+                <FieldDescription>
+                  体检结束后可在“分析与用例”中手动选择模型并启动分析；分析过程中可随时停止。汇总仅使用精简的问题信息，避免重复发送原始证据。
+                </FieldDescription>
+                <Field orientation="horizontal">
+                  <FieldLabel htmlFor="model-enabled">启用该模型</FieldLabel>
+                  <Switch
+                    id="model-enabled"
+                    checked={draft.enabled}
+                    onCheckedChange={(enabled) =>
+                      setDraft({ ...draft, enabled })
+                    }
+                  />
+                </Field>
+              </FieldGroup>
+            </fieldset>
+            <DialogFooter className="mt-6">
+              <Button
+                type="button"
+                variant="outline"
+                disabled={busy}
+                onClick={requestClose}
+              >
+                取消
+              </Button>
+              <Button type="submit" disabled={busy}>
+                <Save data-icon="inline-start" />
+                保存模型配置
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+      {confirmation}
+    </>
   );
 }

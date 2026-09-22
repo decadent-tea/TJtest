@@ -20,6 +20,7 @@ import type {
   LocatorHint,
 } from "../shared/types";
 import { installCollector } from "./collector";
+import { ReplayNetwork } from "./replay-network";
 import { redactBody, redactHeaders, redactText, redactUrl } from "./redact";
 import { finalizeReport } from "./report";
 import {
@@ -46,6 +47,7 @@ interface Session {
   expectedDialog?: Operation;
   handledDialogs: Set<string>;
   deliveredClicks: Set<string>;
+  replayNetwork: ReplayNetwork<Request>;
 }
 const sessions = new Map<string, Session>();
 let launching = false;
@@ -103,6 +105,13 @@ const tracked = (s: Session, promise: Promise<unknown>) => {
   s.tasks.add(promise);
   void promise
     .catch((e) => {
+      // Closing the browser cancels pending header/body reads. This is expected
+      // cleanup, not an executor failure, and must not obscure the real cause.
+      if (
+        s.closing &&
+        /Target page, context or browser has been closed/.test(String(e))
+      )
+        return;
       s.run.notes.push(`采集任务异常：${redactText(String(e))}`);
       s.dirty = true;
     })
@@ -196,6 +205,7 @@ async function addOperation(
     sequence: s.run.operations.length + 1,
     pageId: pageId(s, page),
     framePath: [],
+    navigationMode: event.navigationMode,
     timestamp: event.timestamp || now(),
     kind: event.kind || "click",
     label: actionLabel(event),
@@ -225,6 +235,8 @@ async function addOperation(
   };
   // Plain text input must retain its exact replay value, not JSON pretty-printing.
   if (event.value !== undefined) op.value = redactText(event.value);
+  const opener = await page.opener();
+  if (opener) op.openerPageId = pageId(s, opener);
   s.run.operations.push(op);
   s.current = op;
   s.dirty = true;
@@ -242,6 +254,17 @@ async function addOperation(
 }
 function setupPage(s: Session, page: Page) {
   const id = pageId(s, page);
+  const ensureCollector = () =>
+    tracked(
+      s,
+      page
+        .evaluate(
+          `(() => { const __name = (fn) => fn; (${installCollector.toString()})(); })();`,
+        )
+        .catch(() => {}),
+    );
+  page.on("domcontentloaded", ensureCollector);
+  ensureCollector();
   page.on("domcontentloaded", () =>
     tracked(
       s,
@@ -342,6 +365,40 @@ function setupPage(s: Session, page: Page) {
     (async () => {
       const cdp = await s.context.newCDPSession(page);
       await cdp.send("Page.enable");
+      const { frameTree } = await cdp.send("Page.getFrameTree");
+      let rendererNavigation = false;
+      cdp.on("Page.frameRequestedNavigation", (event) => {
+        if (
+          event.frameId === frameTree.frame.id &&
+          event.disposition === "currentTab"
+        )
+          rendererNavigation = true;
+      });
+      cdp.on("Page.frameStartedNavigating", (event) => {
+        if (event.frameId !== frameTree.frame.id) return;
+        const automatic = rendererNavigation;
+        rendererNavigation = false;
+        if (
+          automatic ||
+          event.navigationType === "sameDocument" ||
+          s.run.mode !== "record" ||
+          s.run.status !== "RECORDING" ||
+          !s.run.operations.some((op) => op.pageId === id)
+        )
+          return;
+        // Address-bar navigation, reload and browser history remain explicit
+        // actions. Renderer redirects and router transitions are only effects.
+        s.eventChain = s.eventChain.then(() =>
+          addOperation(s, page, page.mainFrame(), {
+            kind: "goto",
+            url: event.url,
+            label: event.url,
+            navigationMode: "navigate",
+            module: s.run.scene,
+          }),
+        );
+        tracked(s, s.eventChain);
+      });
       await cdp.send("Log.enable");
       await cdp.send("Network.enable");
       const urls = new Map<string, string>();
@@ -421,7 +478,7 @@ function setupPage(s: Session, page: Page) {
       ),
     );
   });
-  page.on("framenavigated", (frame) => {
+  const recordNavigation = (frame: Frame) => {
     if (
       frame !== page.mainFrame() ||
       s.run.mode !== "record" ||
@@ -429,23 +486,31 @@ function setupPage(s: Session, page: Page) {
       frame.url() === "about:blank"
     )
       return;
-    const last = s.run.operations.at(-1);
-    if (
-      last?.kind === "click" &&
-      last.pageId === id &&
-      Date.now() - Date.parse(last.timestamp) < 1500
-    )
-      return;
-    s.eventChain = s.eventChain.then(() =>
-      addOperation(s, page, frame, {
+    // Capture the URL now: a queued callback may run after another redirect.
+    const url = frame.url();
+    s.eventChain = s.eventChain.then(async () => {
+      const previous = s.run.operations.findLast((op) => op.pageId === id);
+      const opener = await page.opener();
+      // Redirects/router transitions are effects of the preceding action, not
+      // another command to load the document. Retain only the first page entry.
+      if (previous) return;
+      await addOperation(s, page, frame, {
         kind: "goto",
-        url: frame.url(),
-        label: frame.url(),
+        url,
+        label: url,
+        navigationMode: opener ? "observe" : "navigate",
         module: s.run.scene,
-      }),
-    );
+      });
+    });
     tracked(s, s.eventChain);
+  };
+  page.on("framenavigated", recordNavigation);
+  page.on("framenavigated", (frame) => {
+    if (frame === page.mainFrame() && s.run.mode === "replay")
+      s.replayNetwork.navigated(pageId(s, page), s.current?.id);
   });
+  // The first popup document may have committed before context's page event.
+  recordNavigation(page.mainFrame());
   page.on("crash", () => {
     s.run.notes.push(`浏览器页面 ${id} 崩溃。`);
     s.dirty = true;
@@ -453,10 +518,21 @@ function setupPage(s: Session, page: Page) {
 }
 function setupNetwork(s: Session) {
   const calls = new Map<Request, NetworkCall>();
+  const finishBusiness = (req: Request, successful = false) =>
+    s.replayNetwork.finish(req, successful);
   s.context.on("request", (req) => {
     if (s.closing || s.run.status === "PAUSED") return;
     if (s.run.captureStats) s.run.captureStats.requests++;
     const type = req.resourceType();
+    if (type === "document" && req.isNavigationRequest()) {
+      try {
+        const frame = req.frame();
+        if (!frame.parentFrame())
+          s.replayNetwork.clearPage(pageId(s, frame.page()));
+      } catch {
+        // Service-worker requests have no owning frame.
+      }
+    }
     // Match the browser's Fetch/XHR scope before storing or reading any payload.
     if ((type !== "fetch" && type !== "xhr") || isStaticAssetUrl(req.url())) {
       if (s.run.captureStats) s.run.captureStats.filteredRequests++;
@@ -501,6 +577,12 @@ function setupNetwork(s: Session) {
       category,
       confidence: op && !background ? 0.65 : 0.3,
     };
+    // Startup requests can belong to an intermediate document that redirects
+    // away without finishing. Gate replay on action-triggered business calls;
+    // navigation itself is covered by document load and locator readiness.
+    if (category === "business") {
+      s.replayNetwork.start(req, id, op!.id, req.method(), req.url());
+    }
     s.run.requests.push(call);
     calls.set(req, call);
     tracked(
@@ -524,13 +606,16 @@ function setupNetwork(s: Session) {
         s.dirty = true;
       }),
     );
-    if ((res.headers()["content-type"] || "").includes("text/event-stream"))
+    if ((res.headers()["content-type"] || "").includes("text/event-stream")) {
+      finishBusiness(res.request());
       call.bodyNote =
         "SSE 流响应，消息采样见日志（每连接最多 500 条，每条最多 2000 字符）。";
+    }
     s.dirty = true;
   });
   s.context.on("requestfinished", (req) => {
     const call = calls.get(req);
+    finishBusiness(req, !!call?.status && call.status >= 200 && call.status < 400);
     if (!call) return;
     tracked(
       s,
@@ -562,6 +647,7 @@ function setupNetwork(s: Session) {
     );
   });
   s.context.on("requestfailed", (req) => {
+    finishBusiness(req);
     const call = calls.get(req);
     if (!call) return;
     call.failure = redactText(req.failure()?.errorText || "请求失败");
@@ -595,8 +681,11 @@ export async function startSession(input: {
       args: input.headless ? [] : ["--start-maximized"],
     });
     browserRef = browser;
+    const replayViewport =
+      input.flow?.viewport ||
+      (input.headless ? { width: 1920, height: 1080 } : null);
     const context = await browser.newContext({
-      viewport: null,
+      viewport: replayViewport,
       acceptDownloads: true,
     });
     const run: Run = {
@@ -610,6 +699,7 @@ export async function startSession(input: {
       startedAt: now(),
       flowId: input.flow?.id,
       flowVersion: input.flow?.version,
+      viewport: replayViewport || undefined,
       scene: "默认场景",
       archived: false,
       operations: [],
@@ -650,6 +740,7 @@ export async function startSession(input: {
       dialogs: new Map(),
       handledDialogs: new Set(),
       deliveredClicks: new Set(),
+      replayNetwork: new ReplayNetwork(),
     };
     clearInterval(s.flushTimer);
     s.flushTimer = setInterval(() => {
@@ -668,7 +759,7 @@ export async function startSession(input: {
       if (!s.closing) {
         s.run.notes.push("浏览器已关闭，录制/执行中断。");
         s.canceled = true;
-        void finishSession(s, "INTERRUPTED");
+        void finishSession(s, "INTERRUPTED", "浏览器意外关闭，复检中断。");
       }
     });
     await context.exposeBinding("__healthEmit", (source, event) => {
@@ -695,10 +786,18 @@ export async function startSession(input: {
     if (input.flow) {
       void replay(s, input.flow).catch(async (error) => {
         run.notes.push(`执行器异常：${redactText(String(error))}`);
-        await finishSession(s, "INTERRUPTED");
+        await finishSession(
+          s,
+          "INTERRUPTED",
+          `执行器异常：${redactText(String(error))}`,
+        );
       });
     } else {
       const page = await context.newPage();
+      run.viewport = await page.evaluate(() => ({
+        width: innerWidth,
+        height: innerHeight,
+      }));
       void page
         .goto(input.url, { waitUntil: "domcontentloaded", timeout: 30000 })
         .catch((e) => {
@@ -716,10 +815,37 @@ export async function startSession(input: {
     launching = false;
   }
 }
-async function finishSession(s: Session, status: Run["status"]) {
+async function finishSession(
+  s: Session,
+  status: Run["status"],
+  reason?: string,
+) {
   if (s.closing) return;
   s.closing = true;
   s.canceled = true;
+  if (status === "INTERRUPTED" && s.run.mode === "replay") {
+    const running = [...s.run.operations]
+      .reverse()
+      .find((op) => op.status === "RUNNING");
+    const location =
+      running ||
+      [...s.run.operations]
+        .reverse()
+        .find((op) => op.status !== "BLOCKED" && op.status !== "SKIPPED");
+    const message = reason || "复检中断。";
+    s.run.interruption = {
+      reason: message,
+      at: now(),
+      stepId: location?.id,
+      sequence: location?.sequence,
+      label: location?.label,
+    };
+    if (running) {
+      running.status = "FAILED";
+      running.error = message;
+      running.duration = Date.now() - Date.parse(running.timestamp);
+    }
+  }
   clearInterval(s.flushTimer);
   await Promise.allSettled(
     [...s.dialogs.values()].map((d) => d.dialog.dismiss()),
@@ -741,7 +867,7 @@ async function finishSession(s: Session, status: Run["status"]) {
   sessions.delete(s.run.id);
   s.variables = {};
 }
-export async function stopSession(id: string) {
+export async function stopSession(id: string, reason?: string) {
   const s = sessions.get(id);
   if (!s) throw new Error("该体检不是活动任务。");
   if (s.run.mode === "record") {
@@ -782,6 +908,7 @@ export async function stopSession(id: string) {
       : s.run.findings.length
         ? "COMPLETED_WITH_ISSUES"
         : "COMPLETED",
+    s.run.mode === "replay" ? reason || "用户手动中止复检。" : undefined,
   );
   return s.run;
 }
@@ -861,10 +988,26 @@ export async function answerDialog(
   recordDialogResult(s, page, accepted, input);
   return s.run;
 }
-async function resolveLocator(page: Page, op: Operation): Promise<Locator> {
+async function resolveLocator(
+  page: Page,
+  op: Operation,
+  restoreHover?: () => Promise<void>,
+): Promise<Locator> {
   let scope: Page | ReturnType<Page["frameLocator"]> = page;
   for (const css of op.framePath) scope = scope.frameLocator(css);
-  const deadline = Date.now() + op.timeout;
+  const structuralImage =
+    op.kind === "click" && op.position
+      ? op.locators.find(
+          (hint) => hint.kind === "css" && /\s*>\s*img\s*$/.test(hint.value),
+        )
+      : undefined;
+  const imageRoot = structuralImage?.value.match(/^(#[\w-]+)\s*>/)?.[1];
+  const deadline =
+    Date.now() + (imageRoot ? Math.max(op.timeout, 20_000) : op.timeout);
+  const recoveryAt = Date.now() + Math.min(1000, op.timeout / 3);
+  let recovered = false;
+  let ambiguousImage = false;
+  const matches = new Map<string, number>();
   do {
     for (const hint of op.locators) {
       let loc: Locator;
@@ -880,24 +1023,108 @@ async function resolveLocator(page: Page, op: Operation): Promise<Locator> {
               exact: true,
             },
           );
+          // CSS icon-font pseudo content can be part of the accessible name
+          // although it was absent from the recorded DOM text. Keep the role
+          // and exact visible text instead of falling back to a random CSS ID.
+          if (
+            hint.name &&
+            (await loc
+              .filter({ visible: true })
+              .count()
+              .catch(() => 0)) === 0
+          ) {
+            const textPattern = hint.name
+              .trim()
+              .split(/\s+/)
+              .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+              .join("\\s+");
+            loc = scope
+              .getByRole(hint.value as Parameters<Page["getByRole"]>[0])
+              .filter({ hasText: new RegExp(`^\\s*${textPattern}\\s*$`) });
+          }
           break;
         case "label":
           loc = scope.getByLabel(hint.value, { exact: true });
           break;
+        case "placeholder":
+          loc = scope.getByPlaceholder(hint.value, { exact: true });
+          break;
+        case "text":
+          loc = scope.getByText(hint.value, { exact: true });
+          break;
+        case "xpath":
+          loc = scope.locator(
+            hint.value.startsWith("xpath=")
+              ? hint.value
+              : `xpath=${hint.value}`,
+          );
+          break;
         default:
           loc = scope.locator(hint.value);
       }
-      loc = loc.filter({ visible: true });
       if (
+        op.kind === "check" &&
         (await loc.count().catch(() => 0)) === 1 &&
-        (await loc.isEnabled().catch(() => false))
+        (await loc.isChecked().catch(() => undefined)) === !!op.checked
       )
-        return loc;
+        return loc; // A preceding label click may have checked a now-hidden radio.
+      loc = loc.filter({ visible: true });
+      const count = await loc.count().catch(() => -1);
+      matches.set(`${hint.kind}: ${hint.value}`, count);
+      if (
+        count === 1 &&
+        (op.kind === "hover" || op.kind === "scroll" ||
+          (await loc.isEnabled().catch(() => false)))
+      ) return loc;
+    }
+    if (imageRoot && op.position) {
+      const images = scope.locator(`${imageRoot} img`);
+      const candidates = await images
+        .evaluateAll(
+          (nodes, recorded) =>
+            nodes.flatMap((node, index) => {
+              const rect = node.getBoundingClientRect();
+              const style = getComputedStyle(node);
+              if (
+                !rect.width ||
+                !rect.height ||
+                style.visibility === "hidden" ||
+                style.display === "none"
+              )
+                return [];
+              const sameSize =
+                Math.abs(rect.width - recorded.width) <=
+                  Math.max(8, recorded.width * 0.25) &&
+                Math.abs(rect.height - recorded.height) <=
+                  Math.max(8, recorded.height * 0.25);
+              const nearby =
+                Math.abs(rect.x - recorded.x) <=
+                  Math.max(100, recorded.width * 2) &&
+                Math.abs(rect.y - recorded.y) <=
+                  Math.max(120, recorded.height * 4);
+              return sameSize && nearby ? [index] : [];
+            }),
+          op.position,
+        )
+        .catch(() => []);
+      ambiguousImage ||= candidates.length > 1;
+      if (candidates.length === 1) {
+        const recovered = images.nth(candidates[0]).filter({ visible: true });
+        if ((await recovered.count().catch(() => 0)) === 1) return recovered;
+      }
     }
     if (page.isClosed()) throw new Error("目标页签已关闭。");
+    if (restoreHover && !recovered && Date.now() >= recoveryAt) {
+      recovered = true;
+      await restoreHover();
+    }
     await page.waitForTimeout(100);
   } while (Date.now() < deadline && op.locators.length);
-  throw new Error("没有唯一匹配的控件；请编辑定位器或检查页面状态。");
+  throw new Error(
+    ambiguousImage
+      ? "原图片定位器失效，附近存在多个尺寸相近的图片；请编辑定位器，避免误点。"
+      : `没有唯一可操作的控件；可使用 XPath、文本或属性定位器。候选匹配：${[...matches].map(([hint, count]) => `${hint}（${count < 0 ? "定位表达式无效或页面未就绪" : `${count} 个可见匹配`}）`).join("；") || "未配置定位器"}`,
+  );
 }
 function variableValue(
   s: Session,
@@ -914,16 +1141,131 @@ function variableValue(
     return s.variables[key];
   });
 }
+async function pointerPosition(
+  loc: Locator,
+  position: Operation["clickPosition"],
+  timeout: number,
+) {
+  if (!position) return undefined;
+  const { width, height } = await loc.evaluate(
+    (el) => {
+      const rect = el.getBoundingClientRect();
+      const style = getComputedStyle(el);
+      // Playwright adds the top/left border to supplied coordinates. Keep them
+      // inside the current padding box, including when layout shrank since recording.
+      const width =
+        rect.width -
+        (parseFloat(style.borderLeftWidth) || 0) -
+        (parseFloat(style.borderRightWidth) || 0);
+      const height =
+        rect.height -
+        (parseFloat(style.borderTopWidth) || 0) -
+        (parseFloat(style.borderBottomWidth) || 0);
+      return { width, height };
+    },
+    undefined,
+    { timeout },
+  );
+  const inside = (value: number, size: number) => {
+    if (size <= 0) throw new Error("目标控件没有可用的点击区域。");
+    // A two-pixel inset avoids fractional-layout rounding at the boundary.
+    // Preserve interior offsets: an icon inside a button may have its own handler.
+    const inset = Math.min(2, size / 2);
+    return Math.min(Math.max(value, inset), size - inset);
+  };
+  return { x: inside(position.x, width), y: inside(position.y, height) };
+}
+async function hoverPosition(
+  loc: Locator,
+  recorded: Operation["hoverPosition"],
+  timeout: number,
+) {
+  const original = await pointerPosition(loc, recorded, timeout);
+  return loc.evaluate(
+    (el, position) => {
+      const rect = el.getBoundingClientRect();
+      const style = getComputedStyle(el);
+      const left = parseFloat(style.borderLeftWidth) || 0;
+      const top = parseFloat(style.borderTopWidth) || 0;
+      const width =
+        rect.width - left - (parseFloat(style.borderRightWidth) || 0);
+      const height =
+        rect.height - top - (parseFloat(style.borderBottomWidth) || 0);
+      const candidates = [
+        position,
+        { x: width / 2, y: height / 2 },
+        { x: width / 4, y: height / 2 },
+        { x: (width * 3) / 4, y: height / 2 },
+        { x: width / 2, y: height / 4 },
+        { x: width / 2, y: (height * 3) / 4 },
+      ];
+      for (const candidate of candidates) {
+        if (!candidate) continue;
+        const hit = document.elementFromPoint(
+          rect.left + left + candidate.x,
+          rect.top + top + candidate.y,
+        );
+        if (hit && el.contains(hit)) return candidate;
+      }
+      return position;
+    },
+    original,
+    { timeout },
+  );
+}
+async function waitForBusinessIdle(s: Session, page: Page, op: Operation) {
+  // Network idle is unsuitable here: telemetry and event streams can stay open.
+  // Wait for this page's action-triggered Fetch/XHR calls and a quiet render window.
+  const quietMs = 1000;
+  const timeoutMs = Math.max(30_000, op.timeout);
+  const deadline = Date.now() + timeoutMs;
+  let lastActivity = Date.now();
+  let loadingMask = false;
+  while (!s.canceled) {
+    if (page.isClosed()) throw new Error("等待页面就绪时目标页签已关闭。");
+    const network = s.replayNetwork.state(op.pageId);
+    const pending = network.pending;
+    lastActivity = Math.max(
+      lastActivity,
+      network.lastActivity,
+    );
+    const state = await page
+      .evaluate(() => ({
+        loaded: document.readyState === "complete",
+        loadingMask: [
+          ...document.querySelectorAll(
+            ".el-loading-mask.is-fullscreen, .el-loading-mask.init-app",
+          ),
+        ].some((node) => node.getClientRects().length > 0),
+      }))
+      .catch(() => ({ loaded: false, loadingMask: false }));
+    loadingMask = state.loadingMask;
+    if (
+      state.loaded &&
+      !loadingMask &&
+      pending === 0 &&
+      Date.now() - lastActivity >= quietMs
+    )
+      return;
+    if (Date.now() >= deadline)
+      throw new Error(
+        `等待页面与接口响应超时（${timeoutMs / 1000} 秒）；${loadingMask ? "页面加载遮罩仍未消失；" : ""}仍有 ${pending} 个业务请求未结束。${network.urls.length ? `未结束请求：${network.urls.slice(0, 3).map(redactUrl).join("；")}` : ""}`,
+      );
+    await page.waitForTimeout(100);
+  }
+  throw new Error("复检已中止，等待页面与接口响应终止。");
+}
 async function replay(s: Session, flow: Flow) {
   const mapping = new Map<string, Page>();
   const results = new Map<string, Operation>();
-  const blockedScenes = new Set<string>();
+  const blockedScenes = new Map<string, Operation>();
+  const lastHover = new Map<Page, Operation>();
   for (const [index, definition] of flow.operations.entries()) {
     if (s.canceled) break;
     const op: Operation = {
       ...structuredClone(definition),
       timestamp: now(),
-      status: "EXECUTED",
+      status: "RUNNING",
       error: undefined,
       screenshot: undefined,
       sequence: s.run.operations.length + 1,
@@ -946,19 +1288,48 @@ async function replay(s: Session, flow: Flow) {
       op.status = "BLOCKED";
       op.error = explicitDependency
         ? "前置步骤未成功，跳过依赖步骤。"
-        : "本场景关键步骤失败，跳过剩余步骤；继续下一场景。";
+        : `本场景第 ${blockedScenes.get(op.scene)!.sequence} 步“${blockedScenes.get(op.scene)!.label}”失败，跳过剩余步骤；继续下一场景。`;
       results.set(op.id, op);
       s.dirty = true;
       continue;
     }
     let page = mapping.get(op.pageId);
     if (!page) {
+      // A popup can be created asynchronously after its opener's click returns.
+      // Never substitute an unrelated tab or create an empty one for it.
+      if (op.openerPageId) {
+        const deadline = Date.now() + op.timeout;
+        do {
+          for (const candidate of s.context.pages()) {
+            if (
+              !candidate.isClosed() &&
+              ![...mapping.values()].includes(candidate) &&
+              (await candidate.opener()) === mapping.get(op.openerPageId)
+            ) {
+              page = candidate;
+              break;
+            }
+          }
+          if (page || s.canceled) break;
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        } while (Date.now() < deadline);
+        if (!page) {
+          op.status = "FAILED";
+          op.error = "未出现预期的新标签页，请检查打开标签页的前置步骤。";
+          results.set(op.id, op);
+          blockedScenes.set(op.scene, op);
+          s.dirty = true;
+          continue;
+        }
+      }
       page =
+        page ||
         s.context
           .pages()
           .find(
             (p) => !Array.from(mapping.values()).includes(p) && !p.isClosed(),
-          ) || (await s.context.newPage());
+          ) ||
+        (await s.context.newPage());
       mapping.set(op.pageId, page);
       s.pages.set(page, op.pageId);
     }
@@ -971,10 +1342,26 @@ async function replay(s: Session, flow: Flow) {
     try {
       if (page.isClosed()) throw new Error("目标页签已关闭。");
       if (op.kind === "goto") {
-        await page.goto(variableValue(s, op.value || op.url), {
-          waitUntil: "domcontentloaded",
-          timeout: op.timeout,
-        });
+        const destination = variableValue(s, op.value || op.url);
+        // Old recordings also contain navigation effects. Reuse an already
+        // loaded matching document instead of re-submitting its initialization.
+        if (
+          op.navigationMode === "observe" ||
+          (op.navigationMode !== "navigate" &&
+            redactUrl(page.url()) === redactUrl(destination))
+        ) {
+          await page.waitForLoadState("domcontentloaded", {
+            timeout: op.timeout,
+          });
+        } else {
+          // A popup can start requests under the preceding click. Navigating it
+          // replaces that document, so its orphaned requests must not block this goto.
+          s.replayNetwork.clearPage(op.pageId);
+          await page.goto(destination, {
+            waitUntil: "domcontentloaded",
+            timeout: op.timeout,
+          });
+        }
       } else if (op.kind === "dialog") {
         if (!s.handledDialogs.has(op.id))
           throw new Error("没有出现录制时的浏览器对话框。");
@@ -988,24 +1375,65 @@ async function replay(s: Session, flow: Flow) {
           .waitFor({ state: "visible", timeout: op.timeout });
         op.status = "PASSED";
       } else {
-        if (page.url() === "about:blank")
+        if (page.url() === "about:blank" && !op.openerPageId)
           await page.goto(op.url, {
             waitUntil: "domcontentloaded",
             timeout: op.timeout,
           });
-        const loc = await resolveLocator(page, op);
+        // Login can redirect after the previous click's quiet window. Wait for
+        // the recorded document before resolving a similarly named old control.
+        if (!op.framePath.length && /^https?:/.test(op.url)) {
+          const expected = new URL(op.url);
+          await page.waitForURL(
+            (actual) =>
+              actual.origin === expected.origin &&
+              actual.pathname === expected.pathname,
+            { waitUntil: "domcontentloaded", timeout: op.timeout },
+          );
+        }
+        const previousHover = lastHover.get(page);
+        const restoreHover =
+          previousHover &&
+          previousHover.scene === op.scene &&
+          JSON.stringify(previousHover.framePath) ===
+            JSON.stringify(op.framePath)
+            ? async () => {
+                const trigger = await resolveLocator(page!, {
+                  ...previousHover,
+                  timeout: Math.min(1000, op.timeout),
+                });
+                // Some menus close on a delayed mouseleave callback from their
+                // sibling. Re-enter once if the next recorded target is missing.
+                // This retries only hover, never a business click/submission.
+                await page!.mouse.move(0, 0);
+                await trigger.hover({
+                  timeout: Math.min(1500, op.timeout),
+                  position: await hoverPosition(
+                    trigger,
+                    previousHover.hoverPosition,
+                    op.timeout,
+                  ),
+                });
+              }
+            : undefined;
+        const loc = await resolveLocator(page, op, restoreHover);
         switch (op.kind) {
           case "hover":
             await loc.hover({
               timeout: op.timeout,
-              position: op.hoverPosition,
+              position: await hoverPosition(loc, op.hoverPosition, op.timeout),
             });
+            lastHover.set(page, op);
             break;
           case "click":
             s.deliveredClicks.delete(op.id);
             await loc.click({
               timeout: op.timeout,
-              position: op.clickPosition,
+              position: await pointerPosition(
+                loc,
+                op.clickPosition,
+                op.timeout,
+              ),
               button: op.clickButton,
               modifiers: op.clickModifiers,
             });
@@ -1045,6 +1473,18 @@ async function replay(s: Session, flow: Flow) {
             break;
         }
       }
+      if (
+        [
+          "goto",
+          "click",
+          "press",
+          "fill",
+          "check",
+          "select",
+          "upload",
+        ].includes(op.kind)
+      )
+        await waitForBusinessIdle(s, page, op);
       if (op.assertion && op.kind !== "assert") {
         await page
           .getByText(variableValue(s, op.assertion))
@@ -1053,14 +1493,29 @@ async function replay(s: Session, flow: Flow) {
           .waitFor({ state: "visible", timeout: op.timeout });
         op.status = "PASSED";
       }
-      // Small bounded settle period for callbacks; does not serve as a success assertion.
-      await page.waitForTimeout(350);
+      if (
+        ![
+          "goto",
+          "click",
+          "press",
+          "fill",
+          "check",
+          "select",
+          "upload",
+        ].includes(op.kind)
+      )
+        await page.waitForTimeout(350);
+      if (op.status === "RUNNING") op.status = "EXECUTED";
+      if (op.kind !== "hover") lastHover.delete(page);
     } catch (e) {
-      op.status = "FAILED";
-      op.error = redactText(e instanceof Error ? e.message : String(e));
-      if (op.effect === "write" || op.kind === "goto" || op.kind === "click")
-        blockedScenes.add(op.scene);
+      if (!s.closing) {
+        op.status = "FAILED";
+        op.error = redactText(e instanceof Error ? e.message : String(e));
+        if (op.effect === "write" || op.kind === "goto" || op.kind === "click")
+          blockedScenes.set(op.scene, op);
+      }
     }
+    if (s.closing) break;
     op.duration = Date.now() - started;
     results.set(op.id, op);
     await screenshot(s, page, op);
@@ -1069,6 +1524,12 @@ async function replay(s: Session, flow: Flow) {
     put("run", s.run);
   }
   if (!s.closing) {
+    const failed = s.run.operations.filter((op) => op.status === "FAILED");
+    const blocked = s.run.operations.filter((op) => op.status === "BLOCKED");
+    if (failed.length || blocked.length)
+      s.run.notes.push(
+        `复检步骤执行结束：${failed.length} 步失败，${blocked.length} 步因前置失败而阻塞。首个失败：第 ${failed[0]?.sequence ?? blocked[0]?.sequence} 步“${failed[0]?.label ?? blocked[0]?.label}”；请查看该步骤错误和截图。`,
+      );
     finalizeReport(s.run);
     await finishSession(
       s,

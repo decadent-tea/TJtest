@@ -49,7 +49,7 @@ try {
     assert.equal(await scope.locator("#portal-result").textContent(), "延迟成功");
     await stopSession(run.id);
     liveId = "";
-    const hoverIds = run.operations.filter((o) => o.kind === "hover").map((o) => o.locators.find((l) => l.kind === "css")?.value);
+    const hoverIds = run.operations.filter((o) => o.kind === "hover").map((o) => o.locators.filter((l) => l.kind === "css").at(-1)?.value);
     assert.deepEqual(hoverIds, ["#root", "#nested", "#leaf", "#trigger", "#portal-leaf"]);
     assert(run.operations.filter((o) => o.kind === "hover").every((o) => o.effect === "read" && o.framePath.length === (framed ? 1 : 0)));
     const flow: Flow = {

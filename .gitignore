@@ -2,6 +2,7 @@ node_modules/
 dist/
 data/
 output/
+.runtime/
 .env
 *.log
 .playwright-cli/

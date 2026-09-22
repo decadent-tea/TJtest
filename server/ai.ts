@@ -67,6 +67,7 @@ interface AnalysisBatch {
   id: string;
   keys: string[];
   result?: BatchResult;
+  partialResult?: BatchResult;
   usage?: unknown;
 }
 interface AnalysisJob {
@@ -667,13 +668,29 @@ export async function analyze(run: Run, profileId: string) {
   let fatalError: unknown;
   task.promise = (async () => {
     try {
-      const processBatch = async (batch: AnalysisBatch) => {
+      const processBatch = async (
+        batch: AnalysisBatch,
+        repairAttempt = 0,
+      ): Promise<void> => {
         const batchOptions: ModelCallOptions = {
           signal: task.controller.signal,
           onProgress: (p) =>
             activity(batch.id, job.batches.indexOf(batch) + 1, p),
         };
         const bundle = evidence.bundle(batch.keys);
+        const previousCases = new Set(
+          batch.partialResult?.caseDescriptions.map((c) => c.stepId),
+        );
+        const requestBundle = batch.partialResult
+          ? {
+              ...bundle,
+              steps: bundle.steps.filter((step) => !previousCases.has(step.id)),
+              contextSteps: [
+                ...bundle.contextSteps,
+                ...bundle.steps.filter((step) => previousCases.has(step.id)),
+              ],
+            }
+          : bundle;
         let parsed: BatchResult;
         let usage: unknown;
         try {
@@ -681,7 +698,7 @@ export async function analyze(run: Run, profileId: string) {
             profile,
             [
               { role: "system", content: batchPrompt },
-              { role: "user", content: JSON.stringify(bundle) },
+              { role: "user", content: JSON.stringify(requestBundle) },
             ],
             batchOptions,
           );
@@ -729,6 +746,17 @@ export async function analyze(run: Run, profileId: string) {
           }
           throw e;
         }
+        if (batch.partialResult) {
+          parsed.findings = [
+            ...batch.partialResult.findings,
+            ...parsed.findings,
+          ];
+          parsed.caseDescriptions = [
+            ...batch.partialResult.caseDescriptions,
+            ...parsed.caseDescriptions,
+          ];
+        }
+        batch.usage = batch.usage === undefined ? usage : [batch.usage, usage];
         const evidenceIds = new Set(
           [
             ...bundle.steps,
@@ -748,12 +776,6 @@ export async function analyze(run: Run, profileId: string) {
           job.warnings.push(
             `第 ${job.batches.indexOf(batch) + 1} 批忽略 ${ignoredReferences} 个无法由本批输入验证的 AI 证据引用；相关发现未引用虚构证据。`,
           );
-        for (const f of parsed.findings)
-          f.evidenceIds = [
-            ...new Set(
-              f.evidenceIds.flatMap((id) => evidence.aliases.get(id) || [id]),
-            ),
-          ];
         // Models may describe contextSteps despite the prompt. Discard these suggestions;
         // they never create new executed cases or change facts, so valid batch findings can be retained.
         const validCases = new Map<
@@ -767,16 +789,39 @@ export async function analyze(run: Run, profileId: string) {
           else validCases.set(c.stepId, c);
         }
         parsed.caseDescriptions = [...validCases.values()];
-        if (stepIds.size !== validCases.size)
-          throw new Error(
-            `模型遗漏 ${stepIds.size - validCases.size} 个操作用例判定，本批未完成，请继续分析。`,
-          );
         if (ignoredCases)
           job.warnings.push(
             `第 ${job.batches.indexOf(batch) + 1} 批忽略 ${ignoredCases} 条不属于本批步骤或重复的 AI 用例建议，未新增执行步骤。`,
           );
+        if (stepIds.size !== validCases.size) {
+          // Keep validated answers across retries and restarts. Never invent a verdict
+          // or count an incomplete batch as completed.
+          batch.partialResult = parsed;
+          put("analysis-job", job);
+          const message = `模型遗漏 ${stepIds.size - validCases.size} 个操作用例判定`;
+          if (repairAttempt >= 2)
+            throw new Error(
+              `${message}，自动补查后仍未返回，已保存本批结果；继续分析将仅补查遗漏步骤。`,
+            );
+          const current = activities.get(batch.id);
+          if (current)
+            activity(batch.id, job.batches.indexOf(batch) + 1, {
+              ...current,
+              stage: "retrying",
+              lastError: `${message}，正在自动补查（${repairAttempt + 1}/2）。`,
+              updatedAt: new Date().toISOString(),
+            });
+          task.controller.signal.throwIfAborted();
+          return processBatch(batch, repairAttempt + 1);
+        }
+        for (const f of parsed.findings)
+          f.evidenceIds = [
+            ...new Set(
+              f.evidenceIds.flatMap((id) => evidence.aliases.get(id) || [id]),
+            ),
+          ];
         batch.result = parsed;
-        batch.usage = usage;
+        delete batch.partialResult;
         // Persist successful work before publishing progress so a restart can resume it.
         put("analysis-job", job);
         update();

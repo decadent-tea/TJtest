@@ -1,3 +1,5 @@
+import { useSessionState } from "@/lib/use-session-state";
+import { useUnsavedChanges } from "./unsaved-changes";
 import { useState } from "react";
 import { Pencil, Search, Trash2, ArrowUpRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -47,33 +49,50 @@ export function IssueCenter({
 }: {
   issues: Issue[];
   busy: boolean;
-  onOpen: (id: string) => void;
+  onOpen: (issue: Issue) => void;
   onSave: (
     issue: Issue,
     disposition: "open" | "investigating" | "resolved",
     note: string,
-  ) => void;
-  onDelete: (issue: Issue) => void;
+  ) => Promise<boolean>;
+  onDelete: (issue: Issue) => Promise<boolean>;
 }) {
-  const [query, setQuery] = useState("");
-  const [filter, setFilter] = useState("all");
-  const [page, setPage] = useState(0);
-  const [pageSize, setPageSize] = useState(10);
+  const [query, setQuery] = useSessionState<string>("issues-query", "");
+  const [severity, setSeverity] = useSessionState<string>(
+    "issues-severity",
+    "all",
+  );
+  const [error, setError] = useState("");
+  const [filter, setFilter] = useSessionState<string>("issues-filter", "all");
+  const [page, setPage] = useSessionState<number>("issues-page", 0);
+  const [pageSize, setPageSize] = useSessionState<number>(
+    "issues-pageSize",
+    10,
+  );
   const [editing, setEditing] = useState<Issue>();
   const [deleting, setDeleting] = useState<Issue>();
   const [disposition, setDisposition] = useState<
     "open" | "investigating" | "resolved"
   >("open");
   const [note, setNote] = useState("");
+  const { requestClose, confirmation } = useUnsavedChanges(
+    !!editing &&
+      (note !== (editing.note || "") ||
+        disposition !== (editing.disposition || "open")),
+    busy,
+    () => setEditing(undefined),
+  );
   const visible = issues.filter(
     (issue) =>
       `${issue.title} ${issue.module} ${issue.runName} ${issue.project} ${issue.detail}`
         .toLowerCase()
         .includes(query.trim().toLowerCase()) &&
-      (filter === "all" || (issue.disposition || "open") === filter),
+      (filter === "all" || (issue.disposition || "open") === filter) &&
+      (severity === "all" || issue.severity === severity),
   );
   const shownPage = currentPage(page, visible.length, pageSize);
   const edit = (issue: Issue) => {
+    setError("");
     setEditing(issue);
     setDisposition(issue.disposition || "open");
     setNote(issue.note || "");
@@ -125,6 +144,38 @@ export function IssueCenter({
                 </SelectGroup>
               </SelectContent>
             </Select>
+            <Select
+              value={severity}
+              onValueChange={(value) => {
+                setSeverity(value);
+                setPage(0);
+              }}
+            >
+              <SelectTrigger className="w-36" aria-label="问题严重程度">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  <SelectItem value="all">全部严重程度</SelectItem>
+                  <SelectItem value="high">高</SelectItem>
+                  <SelectItem value="medium">中</SelectItem>
+                  <SelectItem value="low">低</SelectItem>
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+            {(query || filter !== "all" || severity !== "all") && (
+              <Button
+                variant="ghost"
+                onClick={() => {
+                  setQuery("");
+                  setFilter("all");
+                  setSeverity("all");
+                  setPage(0);
+                }}
+              >
+                清空筛选
+              </Button>
+            )}
           </div>
           {visible.length ? (
             <div className="space-y-3 mt-5">
@@ -164,7 +215,20 @@ export function IssueCenter({
                       {issue.project} · {issue.runName} · {issue.module} ·{" "}
                       {issue.source === "ai" ? "AI 分析" : "规则发现"}
                     </p>
-                    <p className="mt-2 whitespace-pre-wrap">{issue.detail}</p>
+                    {issue.detail.length > 260 ? (
+                      <details className="mt-2">
+                        <summary className="cursor-pointer text-sm">
+                          {issue.detail.split("\n")[0].slice(0, 150)} · 展开详情
+                        </summary>
+                        <p className="mt-2 whitespace-pre-wrap break-words">
+                          {issue.detail}
+                        </p>
+                      </details>
+                    ) : (
+                      <p className="mt-2 whitespace-pre-wrap break-words">
+                        {issue.detail}
+                      </p>
+                    )}
                     {issue.note && (
                       <p className="small-muted mt-2">处理备注：{issue.note}</p>
                     )}
@@ -172,7 +236,7 @@ export function IssueCenter({
                       <Button
                         variant="outline"
                         size="sm"
-                        onClick={() => onOpen(issue.runId)}
+                        onClick={() => onOpen(issue)}
                       >
                         <ArrowUpRight data-icon="inline-start" />
                         查看证据
@@ -183,12 +247,15 @@ export function IssueCenter({
                         onClick={() => edit(issue)}
                       >
                         <Pencil data-icon="inline-start" />
-                        编辑
+                        处理问题
                       </Button>
                       <Button
                         variant="ghost"
                         size="sm"
-                        onClick={() => setDeleting(issue)}
+                        onClick={() => {
+                          setError("");
+                          setDeleting(issue);
+                        }}
                       >
                         <Trash2 data-icon="inline-start" />
                         删除
@@ -222,17 +289,18 @@ export function IssueCenter({
       <Dialog
         open={!!editing}
         onOpenChange={(open) => {
-          if (!open) setEditing(undefined);
+          if (!open) requestClose();
         }}
       >
         <DialogContent className="sm:max-w-xl">
           <DialogHeader>
-            <DialogTitle>编辑问题</DialogTitle>
+            <DialogTitle>处理问题</DialogTitle>
             <DialogDescription>{editing?.title}</DialogDescription>
           </DialogHeader>
           <label className="grid gap-2">
             处理状态
             <Select
+              disabled={busy}
               value={disposition}
               onValueChange={(value) =>
                 setDisposition(value as typeof disposition)
@@ -253,23 +321,34 @@ export function IssueCenter({
           <label className="grid gap-2">
             处理备注
             <Textarea
+              disabled={busy}
               value={note}
               maxLength={2000}
               onChange={(e) => setNote(e.target.value)}
               placeholder="记录核查结果、修复说明或回归结论"
             />
           </label>
+          {error && (
+            <p role="alert" className="text-destructive text-sm">
+              {error}
+            </p>
+          )}
           <DialogFooter>
+            <Button variant="outline" disabled={busy} onClick={requestClose}>
+              取消
+            </Button>
             <Button
               disabled={busy}
-              onClick={() => {
+              onClick={async () => {
                 if (editing) {
-                  onSave(editing, disposition, note);
-                  setEditing(undefined);
+                  setError("");
+                  if (await onSave(editing, disposition, note))
+                    setEditing(undefined);
+                  else setError("保存未完成，输入已保留。请检查连接后重试。");
                 }
               }}
             >
-              保存
+              {busy ? "正在保存…" : "保存处理结果"}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -277,27 +356,37 @@ export function IssueCenter({
       <Dialog
         open={!!deleting}
         onOpenChange={(open) => {
-          if (!open) setDeleting(undefined);
+          if (!open && !busy) setDeleting(undefined);
         }}
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>删除这条问题？</DialogTitle>
+            <DialogTitle>删除“{deleting?.title}”？</DialogTitle>
             <DialogDescription>
-              问题将从问题中心移除。原始操作、请求和日志证据仍保留在体检记录中。
+              问题将从问题中心、记录的问题列表和后续报告中移除，界面不提供恢复。原始操作、请求和日志仍保留。若只是已完成修复，请使用“处理问题”标记为已解决。
             </DialogDescription>
           </DialogHeader>
+          {error && (
+            <p role="alert" className="text-destructive text-sm">
+              {error}
+            </p>
+          )}
           <DialogFooter>
-            <Button variant="outline" onClick={() => setDeleting(undefined)}>
+            <Button
+              variant="outline"
+              disabled={busy}
+              onClick={() => setDeleting(undefined)}
+            >
               取消
             </Button>
             <Button
               variant="destructive"
               disabled={busy}
-              onClick={() => {
+              onClick={async () => {
                 if (deleting) {
-                  onDelete(deleting);
-                  setDeleting(undefined);
+                  setError("");
+                  if (await onDelete(deleting)) setDeleting(undefined);
+                  else setError("删除未完成，请重试。问题仍保留在列表中。");
                 }
               }}
             >
@@ -306,6 +395,7 @@ export function IssueCenter({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+      {confirmation}
     </>
   );
 }

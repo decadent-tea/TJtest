@@ -29,7 +29,6 @@ import {
 import { finalizeReport, reportHtml } from "./report";
 import { preparedReport, prewarmReport, forgetReport } from "./report-cache";
 import { analyze, callModel, cancelAnalysis } from "./ai";
-import { installDemo } from "./demo";
 import { casesWorkbook } from "./export";
 import { attachmentHeader, downloadName } from "./download-name";
 
@@ -94,7 +93,6 @@ app.get("/api/health", (_req, res) =>
     status: "ok",
     storage: "SQLite",
     active: activeRuns(),
-    demoUrl: `http://127.0.0.1:${port}/demo`,
     version: "0.1.0",
   }),
 );
@@ -177,7 +175,8 @@ app.post(
     const run = requiredRun(req.params.id as string);
     if (["RECORDING", "PAUSED", "REPLAYING"].includes(run.status))
       throw new Error("活动任务无法归档。");
-    run.archived = !run.archived;
+    const input = z.object({ archived: z.boolean().optional() }).parse(req.body || {});
+    run.archived = input.archived ?? !run.archived;
     put("run", run);
     res.json(run);
   }),
@@ -318,6 +317,7 @@ app.post(
       url: run.url,
       version: 1,
       sourceRunId: run.id,
+      viewport: run.viewport,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       operations: structuredClone(run.operations),
@@ -333,7 +333,7 @@ app.post(
   }),
 );
 const locatorSchema = z.object({
-  kind: z.enum(["testId", "role", "label", "css"]),
+  kind: z.enum(["testId", "role", "label", "css", "xpath", "text", "placeholder"]),
   value: z.string().min(1).max(2000),
   name: z.string().optional(),
 });
@@ -341,6 +341,8 @@ const operationSchema = z.object({
   id: z.string(),
   sequence: z.number(),
   pageId: z.string(),
+  openerPageId: z.string().optional(),
+  navigationMode: z.enum(["navigate", "observe"]).optional(),
   framePath: z.array(z.string()),
   timestamp: z.string(),
   kind: z.enum([
@@ -553,7 +555,6 @@ app.use(
     index: false,
   }),
 );
-installDemo(app);
 if (existsSync(resolve("dist/index.html"))) {
   app.use(express.static(resolve("dist")));
   app.get("/{*path}", (_req, res) => res.sendFile(resolve("dist/index.html")));
@@ -579,14 +580,16 @@ app.use(
 );
 app.listen(port, "127.0.0.1", () =>
   console.log(
-    `巡检台 API: http://127.0.0.1:${port} | 演示工程: http://127.0.0.1:${port}/demo`,
+    `巡检台 API: http://127.0.0.1:${port}`,
   ),
 );
 let exiting = false;
 async function shutdown() {
   if (exiting) return;
   exiting = true;
-  await Promise.allSettled(activeRuns().map((r) => stopSession(r.id)));
+  await Promise.allSettled(
+    activeRuns().map((r) => stopSession(r.id, "服务关闭，复检中断。")),
+  );
   process.exit(0);
 }
 process.on("SIGINT", () => void shutdown());

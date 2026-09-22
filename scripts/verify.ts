@@ -24,12 +24,13 @@ const {
 } = await import("../server/recorder");
 const { put, get, encrypt, decrypt } = await import("../server/store");
 const { analyze } = await import("../server/ai");
-const { reportHtml } = await import("../server/report");
+const { reportHtml, reportBlocks, reportText } =
+  await import("../server/report");
 const { casesWorkbook } = await import("../server/export");
-const { installDemo } = await import("../server/demo");
+const { installRecordingFixture } = await import("./fixtures/recording");
 const app = express();
 app.use(express.json());
-installDemo(app);
+installRecordingFixture(app);
 app.get("/fixture/repeat", (_req, res) =>
   res.json({ success: true, data: [] }),
 );
@@ -96,10 +97,10 @@ app.post("/model/chat/completions", (req, res) => {
               failedRequest || badEvidence
                 ? [
                     {
-                      title: "演示接口故障",
+                      title: "验证接口故障",
                       module: "设备台账",
                       severity: "medium",
-                      detail: "观察到演示错误，需要业务核查。",
+                      detail: "观察到接口错误，需要业务核查。",
                       suggestion: "查看接口响应。",
                       evidenceIds: [
                         badEvidence ? "non-existent-id" : failedRequest.id,
@@ -124,7 +125,7 @@ app.post("/model/chat/completions", (req, res) => {
 const server = createServer(app);
 await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
 const port = (server.address() as { port: number }).port;
-const url = `http://127.0.0.1:${port}/demo`;
+const url = `http://127.0.0.1:${port}/fixture/recording`;
 const wsServer = new WebSocketServer({ server, path: "/fixture/socket" });
 wsServer.on("connection", (socket) =>
   socket.send(
@@ -149,7 +150,7 @@ let liveId = "";
 try {
   const run = await startSession({
     name: "闭环验证",
-    project: "演示工程",
+    project: "回归验证工程",
     environment: "自动验证",
     url,
     headless: true,
@@ -351,6 +352,7 @@ try {
     makeStep({
       kind: "goto",
       label: "恢复下一个独立场景入口",
+      navigationMode: "navigate",
       scene: "后续独立场景",
       value: url,
     }),
@@ -492,6 +494,95 @@ try {
   assert(!reportHtml(run).includes("<script>alert(1)</script>"));
   run.name = originalName;
   assert(reportHtml(run).includes("color:#000!important"));
+  const groupedRun = structuredClone(run);
+  groupedRun.operations = run.operations.slice(0, 5).map((op, index) => ({
+    ...op,
+    sequence: [1, 9, 10, 19, 30][index],
+    kind: (["goto", "hover", "hover", "goto", "goto"] as const)[index],
+    label: (
+      [
+        "打开首页",
+        "鼠标悬浮 · 菜单一",
+        "鼠标悬浮 · 菜单二",
+        "打开列表",
+        "打开列表",
+      ] as const
+    )[index],
+    module: "验证模块",
+  }));
+  groupedRun.requests = [];
+  groupedRun.logs = [];
+  groupedRun.analysis.findings = [];
+  const groupedBlocks = reportBlocks(groupedRun);
+  const stepHeading = groupedBlocks.findIndex(
+    (block) => block.kind === "heading" && block.text.startsWith("3.2"),
+  );
+  const displayedSteps = groupedBlocks
+    .slice(
+      stepHeading + 1,
+      groupedBlocks.findIndex(
+        (block, index) => index > stepHeading && block.kind === "heading",
+      ),
+    )
+    .filter((block) => block.kind === "paragraph")
+    .map((block) => block.text)
+    .join("\n");
+  assert.deepEqual(
+    [...displayedSteps.matchAll(/(?:^|；)\s*(\d+)\./gm)].map((match) =>
+      Number(match[1]),
+    ),
+    [1, 2, 3],
+    "合并后的操作路径应按展示顺序连续编号",
+  );
+  const resourceRun = structuredClone(groupedRun);
+  resourceRun.logs = [
+    {
+      id: "resource-font-a",
+      timestamp: new Date().toISOString(),
+      pageId: "page",
+      stepId: resourceRun.operations[0].id,
+      level: "error",
+      text: "Failed to load resource: the server responded with a status of 404 (Not Found)",
+      location: "http://local.test/static/fonts/alpha.woff:0",
+    },
+    {
+      id: "resource-font-b",
+      timestamp: new Date().toISOString(),
+      pageId: "page",
+      stepId: resourceRun.operations[0].id,
+      level: "error",
+      text: "Failed to load resource: the server responded with a status of 404 (Not Found)",
+      location: "http://local.test/static/fonts/beta.ttf:0",
+    },
+  ];
+  const resourceBlocks = reportBlocks(resourceRun);
+  assert.equal(
+    resourceBlocks.filter(
+      (block) =>
+        block.kind === "heading" && block.text.includes("静态资源加载失败"),
+    ).length,
+    1,
+    "同模块同状态码的资源错误应合并展示",
+  );
+  assert(
+    resourceBlocks.some(
+      (block) =>
+        block.kind === "paragraph" &&
+        block.text.includes("alpha.woff") &&
+        block.text.includes("beta.ttf"),
+    ),
+  );
+  assert.equal(
+    reportText(
+      run,
+      "TypeError: 示例异常\n    at wr\n(http://local.test/static/js/chunk-vendors.abcdef1234.js:373:38931)\n日志 ID: aed2dc76, 9ffb5fbc",
+    ),
+    "TypeError: 示例异常",
+  );
+  assert.equal(
+    reportText(run, "Oswald-Bold.abcdef1234.otf"),
+    "Oswald-Bold.otf",
+  );
   run.analysis.findings.push({
     id: "report-sanitization-check",
     source: "ai",
@@ -510,7 +601,9 @@ try {
   assert(!sanitizedHtml.includes(run.operations[0].id));
   assert(!sanitizedHtml.includes(run.requests[0].id));
   assert(!sanitizedHtml.includes("aed2dc76"));
+  assert(!sanitizedHtml.includes("关联证据"));
   assert(sanitizedHtml.includes("HTTP 404"));
+  assert(sanitizedHtml.includes("<strong>模块：</strong>"));
   const { reportDocx } = await import("../server/report-docx");
   const docx = await reportDocx(run);
   const { default: JSZip } = await import("jszip");
@@ -534,6 +627,12 @@ try {
   assert(!documentXml.includes(run.operations[0].id));
   assert(!documentXml.includes(run.requests[0].id));
   assert(documentXml.includes("000000"));
+  const moduleTag = documentXml.indexOf("<w:t>模块：</w:t>");
+  assert(moduleTag >= 0, "问题字段缺少模块标签");
+  assert(
+    /<w:b(?:\s[^>]*)?\/>/.test(documentXml.slice(moduleTag - 250, moduleTag)),
+    "问题字段标签应加粗",
+  );
   results.push(
     "报告导出：DOCX 文件、正文无内部 ID、黑色字体与 Excel 用例宋体格式通过。",
   );
