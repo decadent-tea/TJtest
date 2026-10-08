@@ -31,6 +31,7 @@ import { preparedReport, prewarmReport, forgetReport } from "./report-cache";
 import { analyze, callModel, cancelAnalysis } from "./ai";
 import { casesWorkbook } from "./export";
 import { attachmentHeader, downloadName } from "./download-name";
+import { installAuth } from "./auth";
 
 const app = express();
 app.disable("x-powered-by");
@@ -53,6 +54,11 @@ app.use((req, res, next) => {
   next();
 });
 app.use(express.json({ limit: "3mb" }));
+// Keep the process probe public without exposing task IDs or business data.
+app.get("/api/health", (_req, res) =>
+  res.json({ status: "ok", storage: "SQLite", version: "0.1.0" }),
+);
+installAuth(app);
 recoverInterrupted();
 const route =
   (fn: (req: express.Request, res: express.Response) => unknown) =>
@@ -88,14 +94,6 @@ const recordingSchema = z.object({
   url: urlSchema,
   headless: z.boolean().optional(),
 });
-app.get("/api/health", (_req, res) =>
-  res.json({
-    status: "ok",
-    storage: "SQLite",
-    active: activeRuns(),
-    version: "0.1.0",
-  }),
-);
 app.get("/api/runs", (_req, res) =>
   res.json(list<Run>("run").map((r) => summary(readRun(r.id) || r))),
 );
@@ -175,7 +173,9 @@ app.post(
     const run = requiredRun(req.params.id as string);
     if (["RECORDING", "PAUSED", "REPLAYING"].includes(run.status))
       throw new Error("活动任务无法归档。");
-    const input = z.object({ archived: z.boolean().optional() }).parse(req.body || {});
+    const input = z
+      .object({ archived: z.boolean().optional() })
+      .parse(req.body || {});
     run.archived = input.archived ?? !run.archived;
     put("run", run);
     res.json(run);
@@ -333,7 +333,15 @@ app.post(
   }),
 );
 const locatorSchema = z.object({
-  kind: z.enum(["testId", "role", "label", "css", "xpath", "text", "placeholder"]),
+  kind: z.enum([
+    "testId",
+    "role",
+    "label",
+    "css",
+    "xpath",
+    "text",
+    "placeholder",
+  ]),
   value: z.string().min(1).max(2000),
   name: z.string().optional(),
 });
@@ -579,9 +587,7 @@ app.use(
   },
 );
 app.listen(port, "127.0.0.1", () =>
-  console.log(
-    `巡检台 API: http://127.0.0.1:${port}`,
-  ),
+  console.log(`巡检台 API: http://127.0.0.1:${port}`),
 );
 let exiting = false;
 async function shutdown() {

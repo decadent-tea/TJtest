@@ -4,12 +4,20 @@ export async function api<T>(
   method?: string,
 ): Promise<T> {
   const response = await fetch(`/api${path}`, {
+    credentials: "same-origin",
     method: method || (body === undefined ? "GET" : "POST"),
-    headers:
-      body === undefined ? undefined : { "Content-Type": "application/json" },
+    headers: {
+      "X-Studio-Request": "1",
+      ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+    },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (!response.ok) {
+    if (
+      response.status === 401 &&
+      !["/auth/login", "/auth/setup"].includes(path)
+    )
+      window.dispatchEvent(new Event("studio:auth-expired"));
     const data = await response
       .json()
       .catch(() => ({ error: `服务返回 ${response.status}` }));

@@ -206,6 +206,8 @@ export function Workbench({
     try {
       const response = await fetch(`/api/runs/${run.id}/report`);
       if (!response.ok) {
+        if (response.status === 401)
+          window.dispatchEvent(new Event("studio:auth-expired"));
         const result = await response.json().catch(() => ({}));
         throw new Error(result.error || "报告生成失败。");
       }

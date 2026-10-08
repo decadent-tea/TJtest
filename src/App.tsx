@@ -18,6 +18,9 @@ import {
   Menu,
   RefreshCw,
   X,
+  Users,
+  ShieldCheck,
+  ChevronDown,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -60,6 +63,10 @@ import { FlowList, FlowEditor } from "@/components/flows";
 import { Pagination, currentPage } from "@/components/pagination";
 import { Settings, ModelEditor } from "@/components/settings";
 import { WorkspaceAtmosphere } from "@/components/workspace-atmosphere";
+import { AccountPanel } from "@/components/auth";
+import { UserManagement } from "@/components/users";
+import { RoleManagement } from "@/components/roles";
+import { hasPermission, roleLabel, type User } from "../shared/auth";
 import { api, active } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import type { Summary, Run, Flow, ModelProfile } from "../shared/types";
@@ -73,13 +80,62 @@ const nav = [
   { id: "flows", label: "流程库", icon: Workflow },
   { id: "history", label: "体检记录", icon: History },
   { id: "settings", label: "模型与设置", icon: Settings2 },
+  { id: "users", label: "用户管理", icon: Users },
+  { id: "roles", label: "角色管理", icon: ShieldCheck },
 ];
 function currentRoute() {
   const route = location.hash.slice(1) || "overview";
   return route === "issues" ? "history" : route;
 }
-export function App() {
-  const [route, setRoute] = useState(currentRoute);
+export function App({
+  user,
+  onLogout,
+  onSessionRefresh,
+  onPasswordChanged,
+}: {
+  user: User;
+  onLogout: () => Promise<void>;
+  onSessionRefresh: () => Promise<void>;
+  onPasswordChanged: () => void;
+}) {
+  const canUseWorkspace = hasPermission(user, "workspace.use");
+  const canManageUsers = hasPermission(user, "users.manage");
+  const canManageRoles = hasPermission(user, "roles.manage");
+  const systemNav = [
+    nav.find((item) => item.id === "users")!,
+    nav.find((item) => item.id === "roles")!,
+    nav.find((item) => item.id === "settings")!,
+  ].filter((item) =>
+    item.id === "users"
+      ? canManageUsers
+      : item.id === "roles"
+        ? canManageRoles
+        : canUseWorkspace,
+  );
+  const visibleNav = nav.filter(
+    (item) =>
+      !["users", "roles", "settings"].includes(item.id) && canUseWorkspace,
+  );
+  const homeRoute = canUseWorkspace
+    ? "overview"
+    : canManageUsers
+      ? "users"
+      : "roles";
+  const [route, setRoute] = useState(() =>
+    location.hash ? currentRoute() : homeRoute,
+  );
+  const [systemOpenValue, setSystemOpenValue] = useSessionState<number>(
+    "system-menu-open",
+    0,
+  );
+  const systemOpen = systemOpenValue === 1;
+  const setSystemOpen = (open: boolean) => setSystemOpenValue(open ? 1 : 0);
+  const systemArea = ["users", "roles", "settings"].includes(
+    route.split("/")[0],
+  );
+  useEffect(() => {
+    if (systemArea) setSystemOpen(true);
+  }, [route]);
   const [runs, setRuns] = useState<Summary[]>([]);
   const [flows, setFlows] = useState<Flow[]>([]);
   const [models, setModels] = useState<ModelProfile[]>([]);
@@ -132,12 +188,20 @@ export function App() {
       : "network";
   const focusedIssue = recordDetail ? route.split("/")[3] : undefined;
   const recordsArea = recordDetail || ["history", "archive"].includes(route);
-  const page = route.startsWith("run/")
-    ? "workbench"
-    : recordDetail
-      ? "history"
-      : route;
+  const page = route.startsWith("users/role/")
+    ? "users"
+    : route.startsWith("run/")
+      ? "workbench"
+      : recordDetail
+        ? "history"
+        : route;
   const navPage = recordsArea ? "history" : page;
+  const pageAllowed =
+    page === "users"
+      ? canManageUsers
+      : page === "roles"
+        ? canManageRoles
+        : canUseWorkspace;
   const runId =
     route.startsWith("run/") || recordDetail
       ? route.split("/")[1]
@@ -201,9 +265,13 @@ export function App() {
     try {
       const [h, r, f, m] = await Promise.all([
         api<Health>("/health"),
-        api<Summary[]>("/runs"),
-        api<Flow[]>("/flows"),
-        api<ModelProfile[]>("/settings/models"),
+        canUseWorkspace
+          ? api<Summary[]>("/runs")
+          : Promise.resolve([] as Summary[]),
+        canUseWorkspace ? api<Flow[]>("/flows") : Promise.resolve([] as Flow[]),
+        canUseWorkspace
+          ? api<ModelProfile[]>("/settings/models")
+          : Promise.resolve([] as ModelProfile[]),
       ]);
       setLoaded(true);
       setHealth(h);
@@ -220,11 +288,11 @@ export function App() {
     void refresh();
     const timer = setInterval(() => void refresh(), 3000);
     return () => clearInterval(timer);
-  }, []);
+  }, [canUseWorkspace]);
   useEffect(() => {
     setRun(undefined);
     setRunError("");
-    if (!runId) return;
+    if (!runId || !canUseWorkspace) return;
     let disposed = false;
     const load = async () => {
       try {
@@ -246,7 +314,7 @@ export function App() {
       disposed = true;
       clearInterval(timer);
     };
-  }, [runId, retry]);
+  }, [runId, retry, canUseWorkspace]);
   const actionPending = useRef(false);
   const action = async (fn: () => Promise<void>) => {
     if (actionPending.current) return false;
@@ -351,7 +419,7 @@ export function App() {
         <aside className={cn("sidebar", mobileNav && "mobile-open")}>
           <a
             className="brand"
-            href="#overview"
+            href={`#${homeRoute}`}
             onClick={() => setMobileNav(false)}
           >
             <div className="brand-symbol">
@@ -369,7 +437,7 @@ export function App() {
             <small>测试工作空间 / LOCAL</small>
           </div>
           <nav aria-label="主导航">
-            {nav.map((item) => (
+            {visibleNav.map((item) => (
               <div key={item.id}>
                 <Button
                   variant="ghost"
@@ -399,6 +467,70 @@ export function App() {
                 </Button>
               </div>
             ))}
+            {systemNav.length > 0 && (
+              <div className="system-nav-group">
+                <Button
+                  variant="ghost"
+                  className={cn(
+                    "nav-item system-nav-toggle",
+                    systemArea && "system-nav-current",
+                  )}
+                  aria-expanded={systemOpen}
+                  aria-controls="system-submenu"
+                  onClick={() => setSystemOpen(!systemOpen)}
+                >
+                  <Settings2 size={18} />
+                  <span>系统管理</span>
+                  <ChevronDown
+                    className={cn(
+                      "system-nav-chevron",
+                      systemOpen && "is-open",
+                    )}
+                  />
+                </Button>
+                <motion.div
+                  id="system-submenu"
+                  initial={false}
+                  animate={{
+                    height: systemOpen ? "auto" : 0,
+                    opacity: systemOpen ? 1 : 0,
+                  }}
+                  transition={{ duration: 0.24 }}
+                  className="system-submenu"
+                  inert={!systemOpen}
+                  aria-hidden={!systemOpen}
+                >
+                  <nav aria-label="系统管理子菜单">
+                    {systemNav.map((item) => (
+                      <Button
+                        key={item.id}
+                        variant="ghost"
+                        aria-current={navPage === item.id ? "page" : undefined}
+                        onClick={() => navigate(item.id)}
+                        className={cn(
+                          "nav-item system-nav-child",
+                          navPage === item.id && "nav-active",
+                        )}
+                      >
+                        <item.icon size={16} />
+                        <span>{item.label}</span>
+                        {navPage === item.id && (
+                          <motion.span
+                            className="nav-marker"
+                            layoutId="navigation-indicator"
+                            transition={{
+                              type: "spring",
+                              stiffness: 400,
+                              damping: 38,
+                            }}
+                          />
+                        )}
+                      </Button>
+                    ))}
+                  </nav>
+                </motion.div>
+              </div>
+            )}
           </nav>
           <div className="sidebar-bottom">
             <div className="agent-status">
@@ -422,10 +554,14 @@ export function App() {
               <span className={cn("signal-dot", !health && "signal-idle")} />
             </div>
             <div className="sidebar-person">
-              <div className="person-avatar">测</div>
+              <div className="person-avatar">
+                {user.displayName.slice(0, 1)}
+              </div>
               <div>
-                <strong>测试工程师</strong>
-                <small>本机工作空间</small>
+                <strong>{user.displayName}</strong>
+                <small>
+                  {roleLabel(user)} · {user.username}
+                </small>
               </div>
             </div>
           </div>
@@ -445,17 +581,35 @@ export function App() {
                 {mobileNav ? <X /> : <Menu />}
               </Button>
               <nav className="breadcrumbs" aria-label="面包屑">
-                <a className="breadcrumb-home" href="#overview" onClick={() => setMobileNav(false)}>
+                <a
+                  className="breadcrumb-home"
+                  href={`#${homeRoute}`}
+                  onClick={() => setMobileNav(false)}
+                >
                   北斗天地 / 工作空间
                 </a>
-                <ChevronRight className="breadcrumb-home" size={16} aria-hidden="true" />
-                {recordDetail || page === "archive" ? (
+                <ChevronRight
+                  className="breadcrumb-home"
+                  size={16}
+                  aria-hidden="true"
+                />
+                {systemArea ? (
                   <>
-                    <a href="#history" onClick={() => setMobileNav(false)}>体检记录</a>
+                    <a href={`#${systemNav[0]?.id || homeRoute}`}>系统管理</a>
+                    <ChevronRight size={16} aria-hidden="true" />
+                    <strong aria-current="page">{title}</strong>
+                  </>
+                ) : recordDetail || page === "archive" ? (
+                  <>
+                    <a href="#history" onClick={() => setMobileNav(false)}>
+                      体检记录
+                    </a>
                     <ChevronRight size={16} aria-hidden="true" />
                     {recordDetail && recordOrigin === "archive" && (
                       <>
-                        <a href="#archive" onClick={() => setMobileNav(false)}>已归档记录</a>
+                        <a href="#archive" onClick={() => setMobileNav(false)}>
+                          已归档记录
+                        </a>
                         <ChevronRight size={16} aria-hidden="true" />
                       </>
                     )}
@@ -481,7 +635,25 @@ export function App() {
               >
                 <RefreshCw />
               </Button>
-              <div className="top-avatar">测</div>
+              <AccountPanel
+                user={user}
+                onPasswordChanged={onPasswordChanged}
+                onLogout={() => {
+                  const proceed = () =>
+                    void onLogout().catch((e) =>
+                      toast.error(
+                        e instanceof Error
+                          ? e.message
+                          : "退出登录失败，请重试。",
+                      ),
+                    );
+                  const request = new CustomEvent("studio:before-navigate", {
+                    cancelable: true,
+                    detail: proceed,
+                  });
+                  if (window.dispatchEvent(request)) proceed();
+                }}
+              />
             </div>
           </header>
           <main className="main-content">
@@ -545,7 +717,18 @@ export function App() {
                     }
                   />
                 )}
-                {loaded && (
+                {loaded && !pageAllowed && (
+                  <Blank
+                    title="暂无访问权限"
+                    description="当前角色没有此功能的访问权限。请联系管理员调整角色。"
+                    action={
+                      <Button onClick={() => navigate(homeRoute)}>
+                        返回可用页面
+                      </Button>
+                    }
+                  />
+                )}
+                {loaded && pageAllowed && (
                   <>
                     {(recordDetail || page === "workbench") && runError && (
                       <Alert variant="destructive" className="mb-4">
@@ -929,6 +1112,35 @@ export function App() {
                           </CardContent>
                         </Card>
                       </>
+                    )}
+                    {page === "users" &&
+                      (canManageUsers ? (
+                        <UserManagement
+                          currentUser={user}
+                          initialRole={
+                            route.startsWith("users/role/")
+                              ? route.split("/")[2]
+                              : undefined
+                          }
+                          onSessionRefresh={onSessionRefresh}
+                        />
+                      ) : (
+                        <Blank
+                          title="暂无访问权限"
+                          description="用户管理仅对管理员开放。如需调整账号信息，请联系管理员。"
+                          action={
+                            <Button onClick={() => navigate("overview")}>
+                              返回首页
+                            </Button>
+                          }
+                        />
+                      ))}
+                    {page === "roles" && (
+                      <RoleManagement
+                        currentUser={user}
+                        onSessionRefresh={onSessionRefresh}
+                        onUsers={(roleId) => navigate(`users/role/${roleId}`)}
+                      />
                     )}
                     {page === "settings" && (
                       <>

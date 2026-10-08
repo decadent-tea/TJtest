@@ -4,6 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "verify:auth": "npm run build && tsx scripts/verify-auth.ts",
+    "verify:roles": "npm run build && tsx scripts/verify-roles.ts",
     "dev": "concurrently -k -n API,WEB \"tsx watch server/index.ts\" \"vite --host 127.0.0.1\"",
     "build": "tsc --noEmit && vite build",
     "start": "tsx server/index.ts",

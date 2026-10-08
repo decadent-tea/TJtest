@@ -23,6 +23,6 @@ $listeners = @(Get-NetTCPConnection -LocalPort 4318,5173 -State Listen -ErrorAct
   ProcessId = if ($process) { $process.Id } else { $recordedPid }
   ProcessRunning = [bool]$process
   ApiHealthy = [bool]($health -and $health.status -eq 'ok')
-  ActiveRuns = if ($null -ne $health) { @($health.active).Count } else { $null }
+  ActiveRuns = '登录后在执行工作台查看'
   ListeningPorts = (($listeners | Select-Object -ExpandProperty LocalPort -Unique) -join ', ')
 } | Format-List

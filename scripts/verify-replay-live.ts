@@ -12,6 +12,12 @@ let input = "";
 for await (const chunk of process.stdin) input += chunk;
 const variables = JSON.parse(input || "{}");
 const base = process.env.STUDIO_API_URL || "http://127.0.0.1:4318";
+const studioCookie = process.env.STUDIO_SESSION_COOKIE;
+assert(
+  studioCookie,
+  "请先登录巡检台，并通过 STUDIO_SESSION_COOKIE 提供有效会话 Cookie（studio_session=…）。",
+);
+const studioHeaders = { Cookie: studioCookie, "X-Studio-Request": "1" };
 const directory = resolve(
   "output",
   "verification-live",
@@ -21,16 +27,21 @@ mkdirSync(directory, { recursive: true });
 let activeId: string | undefined;
 try {
   for (let iteration = 1; iteration <= repeat; iteration++) {
-    const flows = (await fetch(`${base}/api/flows`).then((r) =>
-      r.json(),
-    )) as Flow[];
+    const flowResponse = await fetch(`${base}/api/flows`, {
+      headers: studioHeaders,
+    });
+    assert(
+      flowResponse.ok,
+      `无法读取流程：HTTP ${flowResponse.status}，请确认登录会话仍有效。`,
+    );
+    const flows = (await flowResponse.json()) as Flow[];
     const flow = flows.find((f) => f.id === flowId);
     assert(flow, "流程不存在");
     const response = await fetch(
       `${base}/api/flows/${encodeURIComponent(flowId)}/replay`,
       {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { ...studioHeaders, "Content-Type": "application/json" },
         body: JSON.stringify({
           variables,
           environment: "测试环境 · 稳定性验证",
@@ -47,9 +58,14 @@ try {
     while (run.status === "REPLAYING") {
       assert(Date.now() < deadline, "真实复检超过 15 分钟上限");
       await new Promise((r) => setTimeout(r, 1500));
-      run = (await fetch(`${base}/api/runs/${run.id}`).then((r) =>
-        r.json(),
-      )) as Run;
+      const result = await fetch(`${base}/api/runs/${run.id}`, {
+        headers: studioHeaders,
+      });
+      assert(
+        result.ok,
+        `记录读取失败：HTTP ${result.status}，请确认登录会话仍有效。`,
+      );
+      run = (await result.json()) as Run;
       const step = run.operations.at(-1);
       const current = `${step?.sequence} ${step?.kind} ${step?.status}`;
       if (current !== progress) {
@@ -103,8 +119,9 @@ try {
   }
 } finally {
   if (activeId)
-    await fetch(`${base}/api/runs/${activeId}/stop`, { method: "POST" }).catch(
-      () => {},
-    );
+    await fetch(`${base}/api/runs/${activeId}/stop`, {
+      method: "POST",
+      headers: studioHeaders,
+    }).catch(() => {});
   console.log(`验证结果：${directory}`);
 }

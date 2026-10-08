@@ -124,9 +124,21 @@ function reset() {
 reset();
 const app = express();
 app.use(express.json());
-app.get("/api/health", (_, res) =>
-  res.json({ status: "ok", active: [] }),
+app.get("/api/auth/session", (_, res) =>
+  res.json({
+    setupRequired: false,
+    user: {
+      id: "test-admin",
+      username: "tester",
+      displayName: "测试工程师",
+      role: "admin",
+      enabled: true,
+      createdAt: now,
+      updatedAt: now,
+    },
+  }),
 );
+app.get("/api/health", (_, res) => res.json({ status: "ok", active: [] }));
 app.get("/api/runs", (_, res) =>
   res.json(
     runs.map((r) => ({
