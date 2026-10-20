@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>巡检台演示前走查与处理记录 · 2026-10-14</title>
+  <style>
+    *{box-sizing:border-box;font-family:SimSun,"宋体",serif!important;color:#000!important}
+    body{margin:0;background:#eee;line-height:1.85}main{max-width:1120px;margin:24px auto;padding:40px;background:#fff}
+    h1{font-size:27px}h2{font-size:21px;margin-top:30px}p,li,td,th{font-size:16px}table{border-collapse:collapse;width:100%;margin:18px 0}
+    th,td{border:1px solid #aaa;padding:10px 12px;vertical-align:top;text-align:left}th{background:#eee}
+    .decision{padding:16px 20px;border:1px solid #777;background:#f4f4f4}figure{margin:24px 0}img{max-width:100%;height:auto;border:1px solid #aaa}
+    figcaption{font-size:14px}a{text-decoration:underline}code{overflow-wrap:anywhere}details{border:1px solid #aaa;padding:14px;margin-top:18px}
+    @media(max-width:720px){main{margin:0;padding:20px}.table{overflow:auto}table{min-width:640px}}
+    @media print{body{background:#fff}main{max-width:none;margin:0;padding:0}tr,figure{break-inside:avoid}}
+  </style>
+</head>
+<body><main>
+<h1>巡检台演示前走查与处理记录</h1>
+<p>检查日期：2026年10月14日。检查目标：从测试人员实际使用出发，确认录制、证据整理、AI分析、问题定位和导出能否帮助系统体检，并仅处理演示前有必要、风险可控的问题。</p>
+<div class="decision"><p><strong>结论：</strong>可以围绕“人工录制 → 查看真实证据 → Qwen分析 → 定位异常 → 导出报告”演示。系统能够帮助测试人员发现接口失败、明确业务失败标记、运行时错误和页面反馈，并回到对应操作核查。结果只覆盖实际访问和采集到的内容，成功提示和HTTP成功不代表业务功能全部通过。</p><p><strong>演示入口：</strong><a href="http://127.0.0.1:4318/">http://127.0.0.1:4318/</a>，已使用生产模式启动。<strong>模型：</strong>本次实测Qwen可用；DeepSeek返回HTTP 402，需检查账户余额、套餐或计费状态后再使用。</p></div>
+
+<h2>一、按用户流程检查的结果</h2>
+<div class="table"><table>
+<thead><tr><th>步骤</th><th>测试人员需要的效果</th><th>本次结果与证据边界</th></tr></thead><tbody>
+<tr><td>1. 登录与权限</td><td>能进入系统，权限清楚，登录失败能恢复。</td><td>4318页面与服务连通正常。隔离账号完成了验证码刷新、一次性校验、登录失败重试、会话到期和角色权限回归。实际工作空间账号由操作者本人登录，本次未代输密码、未修改账号。</td></tr>
+<tr><td>2. 人工录制</td><td>点一遍页面后，有对应动作、接口、错误和页面反馈。</td><td>真实浏览器录制回归通过：中文输入、菜单、表单、原生对话框、iframe、暂停恢复、短暂提示、迟到响应及停止时落库。静态资源成功与失败均排除，业务运行时错误保留。</td></tr>
+<tr><td>3. 整理与查看证据</td><td>点击某一步，只看这一步；次数不混淆。</td><td>已修复选中操作却显示全程接口的问题。默认显示该步证据，可恢复全程查看。登录接口1次加后续其他接口13次的专项通过，没有记为登录接口14次。</td></tr>
+<tr><td>4. AI逐项分析</td><td>找出有依据的问题，正常提示不报错。</td><td>使用实际配置的Qwen服务分析合成证据：5个操作、17次请求、3条提示，准确保留设备查询HTTP 500问题；未将必填提示、成功提示或人工再次保存列为缺陷，未把未配置断言的步骤判通过。DeepSeek因HTTP 402未完成分析。</td></tr>
+<tr><td>5. 结果与问题定位</td><td>结论与证据一致，能定位到哪个操作、哪个请求。</td><td>已修复旧AI混入、摘要扩写、复现编号不可读。浏览器实测可从结果进入异常请求，看到HTTP状态和响应正文；摘要引用实际次数和已核验问题。明细中的原因与建议仍属于核查方向。</td></tr>
+<tr><td>6. 流程保存与复检</td><td>可以保存流程并重新执行，失败位置清楚。</td><td>通用录制到复检回归通过，包括多页签、SPA、慢请求、实时轮询、遮挡、依赖阻塞及主动停止。现有企业系统长流程的历史失败尚需现场预演，详见后文，不能据通用回归保证整段历史流程必然成功。</td></tr>
+<tr><td>7. 报告与用例导出</td><td>报告可下载、可读，与页面保持一致。</td><td>DOCX与XLSX回归通过；Word报告渲染8页并逐页检查，保持宋体黑色，未见表格重叠、行被切断或正文溢出。页面与报告共同使用核验后的摘要与结论。</td></tr>
+<tr><td>8. 记录、归档与管理</td><td>记录能找回，归档可恢复，管理入口符合权限。</td><td>历史记录、归档、移出归档、删除取消、独立测试数据删除保护及用户、角色管理回归通过。实际工作空间的7条原始体检记录未被测试覆盖或删除。</td></tr>
+</tbody></table></div>
+
+<h2>二、发现的问题及处理评估</h2>
+<div class="table"><table>
+<thead><tr><th>问题与用户影响</th><th>是否有必要</th><th>改动与风险</th><th>处理结果</th></tr></thead><tbody>
+<tr><td>选中第2步后，证据列表仍展示全程请求，容易误解本步调用次数。</td><td>有，直接影响理解和定位效率。</td><td>局部页面交互调整，风险低；不改录制计数。</td><td>选中步骤自动筛选，清除旧搜索和分页；定位异常优先选择问题请求，提供恢复全程查看入口。</td></tr>
+<tr><td>旧AI结论中包含静态资源等已不属于当前范围的判断，仍可能混入风险明细。</td><td>有，会让演示结果自相矛盾。</td><td>局部结果校验，风险低；原始分析保留，不做数据迁移。</td><td>未通过当前证据版本校验的旧AI不计入当前风险或用例描述，页面明确提示重新分析，规则事实可继续查看。</td></tr>
+<tr><td>模型逐项分析正确，但再次生成综合结论时扩写出未观察到的“页面空白、告警风暴”等现象。</td><td>有，属于真实性问题。</td><td>集中在汇总环节的局部修改，风险低；保留主要AI问题分析及建议，减少额外模型调用。</td><td>摘要和结论从已核验问题、实际观察及处置建议整理，页面、导出和保存结果保持一致；问题删除后摘要同步更新。</td></tr>
+<tr><td>AI偶尔把复现或验证步骤写成“1.2”“1.3”，无法照着操作。</td><td>有，影响测试人员复现。</td><td>局部文字整理，风险低；不改变执行顺序和业务行为。</td><td>复现路径按关联的真实录制步骤还原；不可读的验证编号回退到具体接口及页面核查动作。规则与AI合并后保留此路径。</td></tr>
+<tr><td>DeepSeek服务返回HTTP 402。</td><td>需要在演示前规避；服务账户需后续检查。</td><td>未修改服务账户、套餐或余额；只补充明确的错误提示。</td><td>Qwen真实调用已通过，今天使用Qwen演示。HTTP 402不误报为被测网站缺陷。</td></tr>
+</tbody></table></div>
+
+<h2>三、保留的问题与今天的演示边界</h2>
+<p><strong>历史长流程复检先预演。</strong>当前读取到“1010演示 · 复检”的历史结果为105步，8步失败、52步阻塞，首个失败在第46步悬浮定位。此次没有在该企业系统重新执行这段完整流程，不能断言现仍失败，也不能保证演示中会成功。涉及3D页面、动态控件和历史定位器的改造范围较大，演示前不调整这部分核心策略。</p>
+<p><strong>日志来源条数不等于独立业务缺陷数。</strong>历史记录中同一TypeError可能由unhandledrejection和pageerror两个渠道保留。后续可以评估展示归并；今天保持原始采集，避免仓促去重造成漏证据。</p>
+<p><strong>新增页面反馈需新录制。</strong>7条既有记录均来自此前版本，不能补造当时未采集的提示、弹窗、URL变化或加载状态。重新分析可更新AI校验范围；要展示新增采集能力，需要录制新记录。自定义无语义控件、Canvas画面和复杂业务规则仍不等于被自动全面验证。</p>
+
+<h2>四、今天建议的演示顺序</h2>
+<ol>
+<li>进入4318，使用实际账号和刷新后的验证码登录。</li>
+<li>新建一条录制，走3至5个有代表性的操作，包括一次查询、一个提示或弹窗、一处页面切换；如有已知异常，保留其真实出现过程。</li>
+<li>结束录制，点击操作步骤查看对应接口及页面反馈，说明“调用次数”和“证据记录数”的区别。</li>
+<li>选择Qwen分析，展示问题现象、观察事实、建议归属和复测方向；普通提示和未验证步骤不当作通过率成绩。</li>
+<li>点击问题“定位证据”，回到关联步骤和异常响应，再导出体检报告与用例。</li>
+</ol>
+
+<h2>五、当前检查截图</h2>
+<p>以下为本次运行保存并检查的截图；隔离样例使用合成目标数据，AI摘要采用真实配置的Qwen服务生成的问题分析，不是企业系统全站测试结论。</p>
+<figure><img src="../output/playwright/demo-review-2026-10-14/03-qwen-verified-summary.png" alt="真实Qwen分析的核验摘要和测试结论"><figcaption>Qwen识别设备查询HTTP 500；摘要保留实际请求、次数、业务标记和建议，不扩写未观察到的影响。</figcaption></figure>
+<figure><img src="../output/playwright/demo-review-2026-10-14/04-problem-request.png" alt="从问题定位到请求与响应正文"><figcaption>从问题定位到具体请求，查看HTTP 500和“设备服务暂不可用”的原始响应。</figcaption></figure>
+<figure><img src="../output/verification-ui/1791948942819/selected-step-evidence.png" alt="选中操作后的单步骤证据范围"><figcaption>全程有2次接口调用；选中第2步后，接口标签仅显示该步的1次证据，并提供“查看全部步骤”。</figcaption></figure>
+<figure><img src="../output/verification-ui/1791948348242/legacy-analysis.png" alt="历史AI未更新时的基础规则报告"><figcaption>旧AI未通过当前版本校验时，结果明确显示“基础规则报告（历史AI待重新分析）”。</figcaption></figure>
+
+<details><summary>检查依据和验证范围</summary>
+<p>完成构建及类型检查、可信度专项、降噪与计数、页面反馈录制与回放、产品证据、录制边界、760条长记录与149批AI处理、模型流式客户端、15项工作台UI场景、账号和角色管理、归档、集成导出以及自动复检回归。所有自动回归使用独立测试数据；实际工作空间历史记录以只读方式检查。模型实测使用合成证据，不发送企业历史业务记录。</p>
+<p>主流程自动化回归通过不替代对某个企业网站全部功能、全部历史流程或复杂业务规则的现场验证；实际账号登录后的现场流程仍需操作者完成。本次未变更数据库结构、报告模板、账号密码、模型账户或第三方计费配置。</p>
+</details>
+</main></body></html>

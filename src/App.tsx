@@ -83,6 +83,8 @@ const nav = [
   { id: "users", label: "用户管理", icon: Users },
   { id: "roles", label: "角色管理", icon: ShieldCheck },
 ];
+const keepUnchanged = <T,>(previous: T, next: T) =>
+  JSON.stringify(previous) === JSON.stringify(next) ? previous : next;
 function currentRoute() {
   const route = location.hash.slice(1) || "overview";
   return route === "issues" ? "history" : route;
@@ -183,7 +185,9 @@ export function App({
   const recordDetail = route.startsWith("record/");
   const recordTab =
     recordDetail &&
-    ["network", "console", "screen", "report"].includes(route.split("/")[2])
+    ["network", "console", "screen", "feedback", "report"].includes(
+      route.split("/")[2],
+    )
       ? route.split("/")[2]
       : "network";
   const focusedIssue = recordDetail ? route.split("/")[3] : undefined;
@@ -274,10 +278,10 @@ export function App({
           : Promise.resolve([] as ModelProfile[]),
       ]);
       setLoaded(true);
-      setHealth(h);
-      setRuns(r);
-      setFlows(f);
-      setModels(m);
+      setHealth((previous) => keepUnchanged(previous, h));
+      setRuns((previous) => keepUnchanged(previous, r));
+      setFlows((previous) => keepUnchanged(previous, f));
+      setModels((previous) => keepUnchanged(previous, m));
       setConnectionError("");
     } catch (e) {
       setHealth(undefined);
@@ -289,16 +293,22 @@ export function App({
     const timer = setInterval(() => void refresh(), 3000);
     return () => clearInterval(timer);
   }, [canUseWorkspace]);
+  const latestRun = useRef(run);
+  latestRun.current = run;
   useEffect(() => {
     setRun(undefined);
     setRunError("");
     if (!runId || !canUseWorkspace) return;
     let disposed = false;
+    let pending = false;
+    let lastRead = 0;
     const load = async () => {
+      if (pending || disposed) return;
+      pending = true;
       try {
         const r = await api<Run>(`/runs/${runId}`);
         if (!disposed) {
-          setRun(r);
+          setRun((previous) => keepUnchanged(previous, r));
           setRunError("");
           if (location.hash === `#run/${runId}` && !active(r.status))
             location.hash = `record/${runId}`;
@@ -306,13 +316,29 @@ export function App({
       } catch (e) {
         if (!disposed)
           setRunError(e instanceof Error ? e.message : "记录无法读取");
+      } finally {
+        pending = false;
+        lastRead = Date.now();
       }
     };
     void load();
-    const timer = setInterval(() => void load(), 1800);
+    const timer = setInterval(() => {
+      const current = latestRun.current;
+      if (
+        !current ||
+        current.id !== runId ||
+        active(current.status) ||
+        current.analysis.status === "RUNNING" ||
+        Date.now() - lastRead >= 30_000
+      )
+        void load();
+    }, 1800);
+    const refreshOnFocus = () => void load();
+    window.addEventListener("focus", refreshOnFocus);
     return () => {
       disposed = true;
       clearInterval(timer);
+      window.removeEventListener("focus", refreshOnFocus);
     };
   }, [runId, retry, canUseWorkspace]);
   const actionPending = useRef(false);
@@ -768,7 +794,7 @@ export function App({
                         busy={busy}
                         onNew={() => newRecording()}
                         onAction={(name, body) =>
-                          void action(async () => {
+                          action(async () => {
                             const updated = await api<Run>(
                               `/runs/${run!.id}/${name}`,
                               body || {},
@@ -780,13 +806,15 @@ export function App({
                                 ? "执行已结束，证据已保存。"
                                 : name === "scene"
                                   ? "新场景已标记。"
-                                  : name.startsWith("requests/")
-                                    ? "接口业务描述已保存。"
-                                    : name === "dialog"
-                                      ? "对话框选择已记录。"
-                                      : name === "analysis/cancel"
-                                        ? "分析已停止，已完成批次保留。"
-                                        : "采集状态已更新。",
+                                  : name.startsWith("findings/")
+                                    ? "问题归属已保存。"
+                                    : name.startsWith("requests/")
+                                      ? "接口业务描述已保存。"
+                                      : name === "dialog"
+                                        ? "对话框选择已记录。"
+                                        : name === "analysis/cancel"
+                                          ? "分析已停止，已完成批次保留。"
+                                          : "采集状态已更新。",
                             );
                           })
                         }
@@ -837,7 +865,7 @@ export function App({
                         }
                         onNew={() => newRecording()}
                         onAction={(name, body) =>
-                          void action(async () => {
+                          action(async () => {
                             const updated = await api<Run>(
                               `/runs/${runId}/${name}`,
                               body || {},
@@ -846,9 +874,11 @@ export function App({
                             toast.success(
                               name === "analysis/cancel"
                                 ? "分析已停止，已完成批次保留。"
-                                : name.startsWith("requests/")
-                                  ? "接口业务描述已保存。"
-                                  : "记录已更新。",
+                                : name.startsWith("findings/")
+                                  ? "问题归属已保存。"
+                                  : name.startsWith("requests/")
+                                    ? "接口业务描述已保存。"
+                                    : "记录已更新。",
                             );
                           })
                         }

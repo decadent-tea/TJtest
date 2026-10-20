@@ -12,8 +12,10 @@ import { Blank, PageTitle } from "./studio";
 import { reportContent } from "../../shared/report-content";
 import { finalFindings } from "../../server/evidence-quality";
 import { caseView } from "../../server/case-view";
-import type { Finding, Run } from "../../shared/types";
+import type { Finding, Run, ProblemOwner } from "../../shared/types";
+import { OwnershipEditor } from "./ownership-editor";
 import { time } from "@/lib/api";
+import { isAnalysisCurrent } from "../../shared/inspection-evidence";
 
 export function InspectionResult({
   run,
@@ -21,18 +23,35 @@ export function InspectionResult({
   onEvidence,
   onDownload,
   downloading,
+  busy = false,
+  onOwnership,
 }: {
   run: Run;
   onBack: () => void;
   onEvidence: (finding: Finding) => void;
   onDownload: () => void;
   downloading: boolean;
+  busy?: boolean;
+  onOwnership?: (
+    finding: Finding,
+    owners: ProblemOwner[],
+  ) => Promise<boolean> | void;
 }) {
   useEffect(() => {
     window.scrollTo({ top: 0 });
   }, [run.id]);
-  const blocks = useMemo(() => reportContent(run), [run]);
-  const findings = finalFindings(run);
+  const findings = useMemo(() => finalFindings(run), [run]);
+  const blocks = useMemo(() => reportContent(run, findings), [run, findings]);
+  const caseViews = useMemo(
+    () =>
+      new Map(
+        run.cases.map((item) => [item.id, caseView(run, item, findings)]),
+      ),
+    [run, findings],
+  );
+  const reviewedAnalysis = findings.some(
+    (finding) => finding.explanationSource === "ai",
+  );
   const headings = blocks.flatMap((block, index) =>
     block.kind === "heading"
       ? [{ ...block, id: `result-section-${index}` }]
@@ -67,18 +86,6 @@ export function InspectionResult({
     target?.scrollIntoView({ behavior: "smooth", block: "start" });
     target?.focus({ preventScroll: true });
   };
-  if (run.analysis.status !== "COMPLETED")
-    return (
-      <Blank
-        title="体检结果尚未生成"
-        description={
-          run.analysis.status === "RUNNING"
-            ? "分析正在进行，请返回执行证据查看进度。"
-            : "完成 AI 分析后，即可阅读完整体检结果。"
-        }
-        action={<Button onClick={onBack}>返回执行证据</Button>}
-      />
-    );
   return (
     <motion.div
       className="inspection-result"
@@ -116,11 +123,23 @@ export function InspectionResult({
       <div className="result-status">
         <span>
           <FileCheck2 size={17} />
-          分析已完成
+          {run.analysis.status === "COMPLETED"
+            ? isAnalysisCurrent(run)
+              ? "分析已完成"
+              : reviewedAnalysis
+                ? "历史AI分析（已按现有证据复核）"
+                : "基础规则报告（历史AI待重新分析）"
+            : run.analysis.status === "RUNNING"
+              ? "基础规则报告（AI 分析中）"
+              : run.analysis.status === "FAILED"
+                ? "基础规则报告（AI 分析未完成）"
+                : "基础规则报告"}
         </span>
         <span>
-          {run.analysis.provider} / {run.analysis.model} ·{" "}
-          {time(run.analysis.generatedAt)}
+          {run.analysis.status === "COMPLETED" &&
+          (isAnalysisCurrent(run) || reviewedAnalysis)
+            ? `${run.analysis.provider || "模型"} / ${run.analysis.model || "信息未记录"} · ${time(run.analysis.generatedAt)}`
+            : "基于本次采集的规则事实与取证范围"}
         </span>
       </div>
       <div className="result-risk-overview" aria-label="风险分布">
@@ -229,6 +248,13 @@ export function InspectionResult({
                       <ArrowUpRight data-icon="inline-end" />
                     </Button>
                   )}
+                  {finding && onOwnership && (
+                    <OwnershipEditor
+                      finding={finding}
+                      busy={busy}
+                      onSave={(owners) => onOwnership(finding, owners)}
+                    />
+                  )}
                 </div>
               );
             }
@@ -280,25 +306,28 @@ export function InspectionResult({
             <h2>执行用例明细</h2>
           </div>
           <p>
-            通过表示本步操作目标达成。完整用例可通过页面上方“导出用例”下载。
+            通过仅表示配置的页面断言成立；已录制或已执行表示过程状态，业务结果仍待验证。完整用例可通过页面上方“导出用例”下载。
           </p>
           {run.cases.length ? (
             <div className="result-table-wrap">
               <table>
                 <thead>
                   <tr>
-                    {["操作", "接口 / Console", "是否通过", "问题与建议"].map(
-                      (text) => (
-                        <th key={text} scope="col">
-                          {text}
-                        </th>
-                      ),
-                    )}
+                    {[
+                      "操作",
+                      "接口 / Console / 页面导航",
+                      "是否通过",
+                      "问题与建议",
+                    ].map((text) => (
+                      <th key={text} scope="col">
+                        {text}
+                      </th>
+                    ))}
                   </tr>
                 </thead>
                 <tbody>
                   {run.cases.map((item) => {
-                    const view = caseView(run, item);
+                    const view = caseViews.get(item.id)!;
                     return (
                       <tr key={item.id}>
                         <td>
@@ -310,6 +339,20 @@ export function InspectionResult({
                           {view.interface}
                           <br />
                           {view.console}
+                          {view.navigation && (
+                            <>
+                              <br />
+                              {view.navigation}
+                            </>
+                          )}
+                          {view.feedback && (
+                            <>
+                              <br />
+                              {view.feedback}
+                            </>
+                          )}
+                          <br />
+                          {view.evidence}
                         </td>
                         <td>{view.result}</td>
                         <td>

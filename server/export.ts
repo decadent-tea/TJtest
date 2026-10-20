@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import type { Run } from "../shared/types";
 import { finalizeReport } from "./report";
 import { caseView } from "./case-view";
-import { countOf } from "./evidence-quality";
+import { countOf, finalFindings } from "./evidence-quality";
 
 const template = fileURLToPath(
   new URL("../templates/yonglimoban.xlsx", import.meta.url),
@@ -39,7 +39,8 @@ export async function casesWorkbook(run: Run) {
   sheet.unMergeCells("A5:P5");
   sheet.spliceColumns(16, 1);
   sheet.spliceColumns(14, 1);
-  (sheet as unknown as { _columns: unknown[] })._columns.length = headers.length;
+  (sheet as unknown as { _columns: unknown[] })._columns.length =
+    headers.length;
   sheet.mergeCells("A1:N1");
   sheet.mergeCells("A5:N5");
   if (sheet.rowCount > 6) sheet.spliceRows(7, sheet.rowCount - 6);
@@ -63,17 +64,18 @@ export async function casesWorkbook(run: Run) {
     formula: `COUNTIF(I7:I${Math.max(7, run.cases.length + 6)},"失败")`,
     result: run.cases.filter((item) => item.status === "FAILED").length,
   };
-  sheet.getCell("G3").value = "待分析/阻塞/跳过";
+  sheet.getCell("G3").value = "未验证/阻塞/跳过";
   sheet.getCell("H3").value = run.cases.filter(
     (item) => !["PASSED", "FAILED"].includes(item.status),
   ).length;
   sheet.getCell("I3").value = "通过率";
   sheet.getCell("J3").value = {
-    formula: "IF(B3=0,0,D3/B3)",
-    result: run.cases.length
+    formula: 'IF(D3+F3=0,"暂无可判定检查",D3/(D3+F3))',
+    result: run.cases.some((item) => ["PASSED", "FAILED"].includes(item.status))
       ? run.cases.filter((item) => item.status === "PASSED").length /
-        run.cases.length
-      : 0,
+        run.cases.filter((item) => ["PASSED", "FAILED"].includes(item.status))
+          .length
+      : "暂无可判定检查",
   };
   sheet.getCell("J3").numFmt = "0.0%";
   headers.forEach((heading, index) => {
@@ -97,8 +99,9 @@ export async function casesWorkbook(run: Run) {
       wrapText: true,
     };
   });
+  const findings = finalFindings(run);
   for (const [index, testCase] of run.cases.entries()) {
-    const view = caseView(run, testCase);
+    const view = caseView(run, testCase, findings);
     const requests = run.requests.filter((item) =>
       testCase.evidenceIds.includes(item.id),
     );
@@ -106,6 +109,12 @@ export async function casesWorkbook(run: Run) {
       testCase.evidenceIds.includes(item.id),
     );
     const row = sheet.getRow(index + 7);
+    const additionalFeedback = view.feedback
+      .split("\n")
+      .filter((line) => line && !testCase.actual.includes(line));
+    const actual = [testCase.actual, ...additionalFeedback]
+      .filter(Boolean)
+      .join("\n");
     row.values = [
       index + 1,
       testCase.module,
@@ -114,7 +123,7 @@ export async function casesWorkbook(run: Run) {
       view.interface,
       view.console,
       testCase.expected,
-      testCase.actual,
+      actual,
       view.result,
       view.problem,
       view.solution,
@@ -128,7 +137,7 @@ export async function casesWorkbook(run: Run) {
       view.interface,
       view.console,
       testCase.expected,
-      testCase.actual,
+      actual,
       view.problem,
       view.solution,
     ];

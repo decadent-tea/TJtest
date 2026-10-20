@@ -106,7 +106,9 @@ export async function callModel(
       throw new ModelError(
         capacity
           ? "模型上下文容量不足。"
-          : `模型服务返回 HTTP ${response.status}，请检查地址、密钥、模型名称或额度。`,
+          : response.status === 402
+            ? "模型服务拒绝请求（HTTP 402），请检查该模型账户的余额、套餐或计费状态，或改用其他可用模型。"
+            : `模型服务返回 HTTP ${response.status}，请检查地址、密钥、模型名称或额度。`,
         response.status === 429 || response.status >= 500,
         capacity,
       );

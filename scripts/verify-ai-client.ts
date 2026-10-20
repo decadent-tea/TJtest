@@ -20,6 +20,10 @@ let maxOpenRequests = 0;
 app.post("/chat/completions", (req, res) => {
   const mode = req.body.model;
   assert.equal(req.body.stream, true);
+  if (mode === "billing-required") {
+    res.status(402).json({ error: "payment required" });
+    return;
+  }
   if (mode === "qwen3.8-flash") {
     assert.equal(req.body.enable_thinking, false);
     assert.equal(req.body.response_format.type, "json_object");
@@ -120,6 +124,13 @@ try {
   assert.deepEqual(result.usage, { total_tokens: 30 });
   assert(updates.some((u) => u.stage === "generating"));
   assert(updates.some((u) => u.receivedCharacters > 0));
+  await assert.rejects(
+    () =>
+      callModel({ ...profile, provider: "Custom", model: "billing-required" }, [
+        { role: "user", content: "test" },
+      ]),
+    /HTTP 402.*余额、套餐或计费状态/,
+  );
   await assert.rejects(
     () =>
       callModel({ ...profile, provider: "Custom", model: "disconnect" }, [

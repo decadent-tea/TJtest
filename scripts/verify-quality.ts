@@ -102,8 +102,8 @@ request({ responseBody: '{"success":false,"data":null}' });
 request({ duration: 11000 });
 assert.equal(
   problemRequests(run).length,
-  5,
-  "静态失败、后台失败、网络失败、业务失败和慢请求必须保留",
+  4,
+  "全部静态资源排除；后台失败、网络失败、业务失败和慢请求保留",
 );
 assert.equal(
   requestProblem({
@@ -151,15 +151,19 @@ captureLog(run, {
 assert.equal(run.logs.length, 3);
 assert.equal(run.logs[0].occurrences, 2);
 assert.equal(run.captureStats!.requests, 13);
-assert.equal(run.captureStats!.filteredRequests, 3);
-assert.equal(interfaceTotal(run), 10, "接口总数应排除过滤的资源和后台请求");
+assert.equal(run.captureStats!.filteredRequests, 4);
+assert.equal(
+  interfaceTotal(run),
+  9,
+  "接口总数按保留请求的occurrences计算，排除全部静态资源",
+);
 assert.equal(run.captureStats!.mergedRequests, 1);
 assert.equal(run.captureStats!.logs, 5);
 assert.equal(run.captureStats!.filteredLogs, 1);
 assert.equal(
   consoleTotal(run),
-  3,
-  "Console 总数应排除 SSE 和下载事件，但保留被过滤的普通控制台消息",
+  2,
+  "Console 总数仅计保留的有效日志次数，排除普通噪声、静态加载、SSE和下载事件",
 );
 const interfaceCountBeforeStaticChunk = interfaceTotal(run);
 const staticChunk = request({
@@ -191,7 +195,7 @@ run.analysis.findings = [
 ];
 assert.equal(
   problemRequests(run).length,
-  5,
+  4,
   "AI 引用正常接口作为上下文时，不得将该接口虚构为问题接口",
 );
 const huge = request({

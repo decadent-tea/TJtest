@@ -265,11 +265,13 @@ try {
     run.requests.filter((r) => r.url.endsWith("/fixture/repeat")).length,
     1,
   );
-  assert(
-    !run.requests.some(
-      (r) =>
-        r.url.endsWith("/fixture/ping") || r.url.endsWith("/fixture/asset.js"),
-    ),
+  assert(!run.requests.some((r) => r.url.endsWith("/fixture/asset.js")));
+  assert.equal(
+    run.requests
+      .filter((r) => r.url.endsWith("/fixture/ping"))
+      .reduce((sum, r) => sum + (r.occurrences || 1), 0),
+    3,
+    "不能仅凭ping路径丢弃成功Fetch/XHR证据",
   );
   assert(!run.logs.some((l) => l.text === "quality-debug-noise"));
   assert.equal(
@@ -453,7 +455,11 @@ try {
   assert.equal(run.analysis.findings.length, 1);
   assert.equal(run.cases[0].title, "检查工程入口页面");
   assert(!run.cases[0].expected.includes("人工确认"));
-  assert.equal(run.cases[0].status, "PASSED");
+  assert.equal(
+    run.cases[0].status,
+    "RECORDED",
+    "AI不得将未验证录制步骤升级为通过",
+  );
   badEvidence = true;
   await analyze(run, profile.id);
   await waitFor(
@@ -527,13 +533,9 @@ try {
     .filter((block) => block.kind === "paragraph")
     .map((block) => block.text)
     .join("\n");
-  assert.deepEqual(
-    [...displayedSteps.matchAll(/(?:^|；)\s*(\d+)\./gm)].map((match) =>
-      Number(match[1]),
-    ),
-    [1, 2, 3],
-    "合并后的操作路径应按展示顺序连续编号",
-  );
+  assert.match(displayedSteps, /第1步：/);
+  assert.match(displayedSteps, /第9—10步（2次悬浮）/);
+  assert.match(displayedSteps, /第19—30步（2次跳转）/);
   const resourceRun = structuredClone(groupedRun);
   resourceRun.logs = [
     {
@@ -561,11 +563,11 @@ try {
       (block) =>
         block.kind === "heading" && block.text.includes("静态资源加载失败"),
     ).length,
-    1,
-    "同模块同状态码的资源错误应合并展示",
+    0,
+    "成功失败静态资源及明确资源加载日志均不进入报告",
   );
   assert(
-    resourceBlocks.some(
+    !resourceBlocks.some(
       (block) =>
         block.kind === "paragraph" &&
         block.text.includes("alpha.woff") &&
@@ -577,7 +579,7 @@ try {
       run,
       "TypeError: 示例异常\n    at wr\n(http://local.test/static/js/chunk-vendors.abcdef1234.js:373:38931)\n日志 ID: aed2dc76, 9ffb5fbc",
     ),
-    "TypeError: 示例异常",
+    "TypeError: 示例异常\n堆栈位置：前端脚本:373:38931",
   );
   assert.equal(
     reportText(run, "Oswald-Bold.abcdef1234.otf"),
@@ -602,7 +604,10 @@ try {
   assert(!sanitizedHtml.includes(run.requests[0].id));
   assert(!sanitizedHtml.includes("aed2dc76"));
   assert(!sanitizedHtml.includes("关联证据"));
-  assert(sanitizedHtml.includes("HTTP 404"));
+  assert(
+    sanitizedHtml.includes(`HTTP ${run.requests[0].status}`),
+    "观察事实必须来自真实请求状态，不能使用模型伪造的404",
+  );
   assert(sanitizedHtml.includes("<strong>模块：</strong>"));
   const { reportDocx } = await import("../server/report-docx");
   const docx = await reportDocx(run);
@@ -612,8 +617,8 @@ try {
   assert(documentXml.includes("体检报告"));
   for (const label of [
     "目录",
-    "执行总数",
-    "接口总数",
+    "操作记录总数",
+    "保留的 Fetch/XHR 调用次数",
     "Console 总数",
     "通过率",
     "问题接口",

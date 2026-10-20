@@ -51,3 +51,19 @@ export function redactUrl(value: string) {
     return redactText(value);
   }
 }
+
+// Preserve hash-router paths for page observations, while retaining the stricter
+// URL policy for network payloads and stripping authentication-only fragments.
+export function redactFeedbackUrl(value: string) {
+  const clean = redactUrl(value);
+  try {
+    const raw = new URL(value);
+    const fragment = raw.hash.replace(/^#!?/, "");
+    if (!fragment.startsWith("/")) return clean;
+    const route = new URL(fragment, raw.origin);
+    const safe = new URL(redactUrl(route.href));
+    return `${clean}#${safe.pathname}${safe.search}`;
+  } catch {
+    return clean;
+  }
+}

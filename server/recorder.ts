@@ -4,6 +4,7 @@ import {
   type BrowserContext,
   type Page,
   type Request,
+  type Response,
   type Frame,
   type Locator,
   type Dialog,
@@ -18,11 +19,22 @@ import type {
   NetworkCall,
   Flow,
   LocatorHint,
+  PageObservation,
 } from "../shared/types";
 import { installCollector } from "./collector";
+import { installFeedbackCollector } from "./page-feedback-collector";
+import { captureFeedback } from "./page-feedback";
 import { ReplayNetwork } from "./replay-network";
-import { redactBody, redactHeaders, redactText, redactUrl } from "./redact";
+import {
+  redactBody,
+  redactHeaders,
+  redactObject,
+  redactText,
+  redactUrl,
+  redactFeedbackUrl,
+} from "./redact";
 import { finalizeReport } from "./report";
+import { endpoint, EVIDENCE_VERSION } from "../shared/inspection-evidence";
 import {
   captureLog,
   finishRequest,
@@ -34,8 +46,14 @@ interface Session {
   browser: Browser;
   context: BrowserContext;
   pages: Map<Page, string>;
+  operationFrames: Map<string, Frame>;
   current?: Operation;
   closing: boolean;
+  closingAt?: number;
+  feedbackClosed?: boolean;
+  feedbackLocations: Map<Frame, { url?: string; title?: string }>;
+  finishPromise?: Promise<void>;
+  pendingNetwork: Set<Request>;
   tasks: Set<Promise<unknown>>;
   dirty: boolean;
   flushTimer: ReturnType<typeof setInterval>;
@@ -72,18 +90,12 @@ function describeRequest(
   method: string,
   category: NetworkCall["category"],
   module: string,
+  url?: string,
 ) {
   if (category === "resource") return "页面静态资源";
-  if (category === "background") return "后台心跳 / 遥测";
-  if (category === "initialization") return `加载${module}页面数据`;
-  const object = op?.module || module;
-  const label = op?.label || "";
-  if (/查询|搜索|筛选|刷新/.test(label)) return `查询${object}关联数据`;
-  if (/导出|下载/.test(label)) return `导出${object}数据`;
-  if (/删除|移除/.test(label)) return `删除${object}记录`;
-  if (/保存|提交/.test(label)) return `保存${object}信息`;
-  if (/下发|控制/.test(label)) return `下发${object}指令`;
-  return `${label} · ${method === "GET" ? "获取关联数据" : "提交业务请求"}`;
+  if (category === "background")
+    return `${method} ${endpoint(url || "")} · 后台心跳 / 遥测`;
+  return `${method} ${endpoint(url || "")} · ${category === "initialization" ? "页面初始化" : "操作时间关联"}`;
 }
 const actionLabel = (op: Partial<Operation>) =>
   ({
@@ -125,11 +137,19 @@ function pageId(s: Session, page: Page) {
   }
   return id;
 }
-function latest(s: Session, id: string) {
+function latest(s: Session, id: string, frame?: Frame) {
   const op =
     s.run.mode === "replay"
-      ? s.current
-      : [...s.run.operations].reverse().find((o) => o.pageId === id);
+      ? s.current?.pageId === id
+        ? s.current
+        : undefined
+      : [...s.run.operations]
+          .reverse()
+          .find(
+            (o) =>
+              o.pageId === id &&
+              (!frame || s.operationFrames.get(o.id) === frame),
+          );
   return op && Date.now() - Date.parse(op.timestamp) < 10000 ? op : undefined;
 }
 async function framePath(frame: Frame) {
@@ -235,9 +255,18 @@ async function addOperation(
   };
   // Plain text input must retain its exact replay value, not JSON pretty-printing.
   if (event.value !== undefined) op.value = redactText(event.value);
-  const opener = await page.opener();
-  if (opener) op.openerPageId = pageId(s, opener);
   s.run.operations.push(op);
+  s.operationFrames.set(op.id, frame);
+  if (op.kind === "goto") {
+    const navigation = s.run.pageObservations?.findLast(
+      (item) =>
+        item.pageId === op.pageId &&
+        item.url === op.url &&
+        Math.abs(Date.parse(op.timestamp) - Date.parse(item.timestamp)) <
+          10_000,
+    );
+    if (navigation) navigation.stepId = op.id;
+  }
   s.current = op;
   s.dirty = true;
   if (op.kind === "upload")
@@ -247,6 +276,8 @@ async function addOperation(
   tracked(
     s,
     (async () => {
+      const opener = await page.opener();
+      if (opener) op.openerPageId = pageId(s, opener);
       op.framePath = await framePath(frame);
       await screenshot(s, page, op);
     })(),
@@ -259,7 +290,7 @@ function setupPage(s: Session, page: Page) {
       s,
       page
         .evaluate(
-          `(() => { const __name = (fn) => fn; (${installCollector.toString()})(); })();`,
+          `(() => { const __name = (fn) => fn; (${installCollector.toString()})(); (${installFeedbackCollector.toString()})(); })();`,
         )
         .catch(() => {}),
     );
@@ -269,7 +300,13 @@ function setupPage(s: Session, page: Page) {
     tracked(
       s,
       (async () => {
-        if (s.run.mode !== "record" || s.closing) return;
+        if (
+          s.run.mode !== "record" ||
+          s.closing ||
+          s.run.status !== "RECORDING"
+        )
+          return;
+        const loadedUrl = redactUrl(page.url());
         const title = await page
           .locator("main h1,h1")
           .first()
@@ -278,21 +315,23 @@ function setupPage(s: Session, page: Page) {
         const module = redactText(title || s.run.project);
         const op = [...s.run.operations]
           .reverse()
-          .find((o) => o.kind === "goto" && o.pageId === id);
+          .find(
+            (o) => o.kind === "goto" && o.pageId === id && o.url === loadedUrl,
+          );
+        if (s.run.status !== "RECORDING" || redactUrl(page.url()) !== loadedUrl)
+          return;
         if (op) {
           op.module = module;
           op.label = `打开页面 · ${module}`;
           for (const req of s.run.requests)
-            if (
-              req.pageId === id &&
-              (req.stepId === op.id || req.category === "initialization")
-            ) {
+            if (req.pageId === id && req.stepId === op.id) {
               req.module = module;
               req.description = describeRequest(
                 op,
                 req.method,
                 "initialization",
                 module,
+                req.url,
               );
               req.category = "initialization";
             }
@@ -388,15 +427,17 @@ function setupPage(s: Session, page: Page) {
           return;
         // Address-bar navigation, reload and browser history remain explicit
         // actions. Renderer redirects and router transitions are only effects.
-        s.eventChain = s.eventChain.then(() =>
-          addOperation(s, page, page.mainFrame(), {
-            kind: "goto",
-            url: event.url,
-            label: event.url,
-            navigationMode: "navigate",
-            module: s.run.scene,
-          }),
-        );
+        s.eventChain = s.eventChain
+          .catch(() => {})
+          .then(() =>
+            addOperation(s, page, page.mainFrame(), {
+              kind: "goto",
+              url: event.url,
+              label: event.url,
+              navigationMode: "navigate",
+              module: s.run.scene,
+            }),
+          );
         tracked(s, s.eventChain);
       });
       await cdp.send("Log.enable");
@@ -457,6 +498,7 @@ function setupPage(s: Session, page: Page) {
     })(),
   );
   page.on("download", (download) => {
+    if (s.closing || s.run.status === "PAUSED") return;
     captureLog(s.run, {
       id: randomUUID(),
       timestamp: now(),
@@ -488,20 +530,22 @@ function setupPage(s: Session, page: Page) {
       return;
     // Capture the URL now: a queued callback may run after another redirect.
     const url = frame.url();
-    s.eventChain = s.eventChain.then(async () => {
-      const previous = s.run.operations.findLast((op) => op.pageId === id);
-      const opener = await page.opener();
-      // Redirects/router transitions are effects of the preceding action, not
-      // another command to load the document. Retain only the first page entry.
-      if (previous) return;
-      await addOperation(s, page, frame, {
-        kind: "goto",
-        url,
-        label: url,
-        navigationMode: opener ? "observe" : "navigate",
-        module: s.run.scene,
+    s.eventChain = s.eventChain
+      .catch(() => {})
+      .then(async () => {
+        const previous = s.run.operations.findLast((op) => op.pageId === id);
+        const opener = await page.opener();
+        // Redirects/router transitions are effects of the preceding action, not
+        // another command to load the document. Retain only the first page entry.
+        if (previous) return;
+        await addOperation(s, page, frame, {
+          kind: "goto",
+          url,
+          label: url,
+          navigationMode: opener ? "observe" : "navigate",
+          module: s.run.scene,
+        });
       });
-    });
     tracked(s, s.eventChain);
   };
   page.on("framenavigated", recordNavigation);
@@ -518,6 +562,8 @@ function setupPage(s: Session, page: Page) {
 }
 function setupNetwork(s: Session) {
   const calls = new Map<Request, NetworkCall>();
+  const frameTasks = new Map<Request, Promise<void>>();
+  const navigationCalls = new Map<Request, PageObservation>();
   const finishBusiness = (req: Request, successful = false) =>
     s.replayNetwork.finish(req, successful);
   s.context.on("request", (req) => {
@@ -527,18 +573,40 @@ function setupNetwork(s: Session) {
     if (type === "document" && req.isNavigationRequest()) {
       try {
         const frame = req.frame();
-        if (!frame.parentFrame())
+        if (!frame.parentFrame()) {
           s.replayNetwork.clearPage(pageId(s, frame.page()));
+          if (!isStaticAssetUrl(req.url())) {
+            const id = pageId(s, frame.page());
+            const observation: PageObservation = {
+              id: randomUUID(),
+              timestamp: now(),
+              pageId: id,
+              stepId: latest(s, id, frame)?.id,
+              url: redactUrl(req.url()),
+              kind: "navigation",
+            };
+            (s.run.pageObservations ??= []).push(observation);
+            navigationCalls.set(req, observation);
+          }
+        }
       } catch {
         // Service-worker requests have no owning frame.
       }
     }
     // Match the browser's Fetch/XHR scope before storing or reading any payload.
     if ((type !== "fetch" && type !== "xhr") || isStaticAssetUrl(req.url())) {
+      if (
+        s.run.captureStats?.staticRequests !== undefined &&
+        (isStaticAssetUrl(req.url()) ||
+          ["script", "stylesheet", "image", "font", "media"].includes(type))
+      )
+        s.run.captureStats.staticRequests++;
       if (s.run.captureStats) s.run.captureStats.filteredRequests++;
       s.dirty = true;
       return;
     }
+    if (s.run.captureStats?.apiRequests !== undefined)
+      s.run.captureStats.apiRequests++;
     let page: Page | undefined;
     try {
       page = req.frame().page();
@@ -546,17 +614,16 @@ function setupNetwork(s: Session) {
       /* Service worker has no frame */
     }
     const id = page ? pageId(s, page) : "worker";
-    const op = latest(s, id);
-    const background = /heartbeat|\/ping\b|metrics|analytics|telemetry/.test(
-      req.url(),
-    );
-    const category = isStaticAssetUrl(req.url())
-      ? "resource"
-      : background
-        ? "background"
-        : op && op.kind !== "goto"
-          ? "business"
-          : "initialization";
+    let requestFrame: Frame | undefined;
+    try {
+      requestFrame = req.frame();
+    } catch {
+      /* Worker has no frame. */
+    }
+    const op = latest(s, id, requestFrame);
+    // URL words such as metrics can be business APIs. Keep all Fetch/XHR calls;
+    // automatic noise removal must never silently infer their business purpose.
+    const category = op && op.kind !== "goto" ? "business" : "initialization";
     const module = op?.module || s.run.scene;
     const call: NetworkCall = {
       id: randomUUID(),
@@ -575,8 +642,35 @@ function setupNetwork(s: Session) {
       description: describeRequest(op, req.method(), category, module),
       module,
       category,
-      confidence: op && !background ? 0.65 : 0.3,
+      completion: "pending",
+      confidence: op ? 0.65 : 0.3,
+      association: op
+        ? s.run.mode === "replay" &&
+          !["hover", "scroll", "goto"].includes(op.kind)
+          ? "action-context"
+          : "time-candidate"
+        : "page",
     };
+    call.description = describeRequest(
+      op,
+      req.method(),
+      category,
+      module,
+      redactUrl(req.url()),
+    );
+    call.events = [
+      { id: call.id, startedAt: call.startedAt, pageId: id, stepId: op?.id },
+    ];
+    try {
+      const pathTask = framePath(req.frame()).then((path) => {
+        call.framePath = path;
+        call.events![0].framePath = path;
+      });
+      frameTasks.set(req, pathTask);
+      tracked(s, pathTask);
+    } catch {
+      call.association = "unknown";
+    }
     // Startup requests can belong to an intermediate document that redirects
     // away without finishing. Gate replay on action-triggered business calls;
     // navigation itself is covered by document load and locator readiness.
@@ -585,6 +679,7 @@ function setupNetwork(s: Session) {
     }
     s.run.requests.push(call);
     calls.set(req, call);
+    s.pendingNetwork.add(req);
     tracked(
       s,
       req.allHeaders().then((headers) => {
@@ -595,6 +690,11 @@ function setupNetwork(s: Session) {
     s.dirty = true;
   });
   s.context.on("response", (res) => {
+    const navigation = navigationCalls.get(res.request());
+    if (navigation) {
+      navigation.status = res.status();
+      s.dirty = true;
+    }
     const call = calls.get(res.request());
     if (!call) return;
     call.status = res.status();
@@ -608,58 +708,214 @@ function setupNetwork(s: Session) {
     );
     if ((res.headers()["content-type"] || "").includes("text/event-stream")) {
       finishBusiness(res.request());
+      s.pendingNetwork.delete(res.request());
+      call.completion = "streaming";
+      call.bodyState = "streaming";
       call.bodyNote =
         "SSE 流响应，消息采样见日志（每连接最多 500 条，每条最多 2000 字符）。";
     }
     s.dirty = true;
   });
   s.context.on("requestfinished", (req) => {
+    navigationCalls.delete(req);
     const call = calls.get(req);
-    finishBusiness(req, !!call?.status && call.status >= 200 && call.status < 400);
+    finishBusiness(
+      req,
+      !!call?.status && call.status >= 200 && call.status < 400,
+    );
     if (!call) return;
     tracked(
       s,
       (async () => {
-        call.duration = Date.now() - Date.parse(call.startedAt);
-        const res = await req.response();
-        if (res) {
-          const type = res.headers()["content-type"] || "";
-          if (/json|text\//.test(type)) {
-            const size = await req.sizes().catch(() => undefined);
-            if (size && size.responseBodySize > 262144)
-              call.bodyNote = "正文超过 256KB，仅保留元数据。";
-            else {
-              const body = await res.body().catch(() => undefined);
-              if (body) {
-                call.responseBody = redactBody(
-                  body.toString("utf8").slice(0, 262144),
-                );
-                if (body.length > 262144)
-                  call.bodyNote = "正文已截断至 256KB。";
-              } else call.bodyNote = "响应正文不可读取。";
-            }
-          } else call.bodyNote = "非 JSON/文本响应，仅保留元数据。";
+        try {
+          call.duration = Date.now() - Date.parse(call.startedAt);
+          const res = await req.response();
+          if (call.completion !== "stopped") call.completion = "complete";
+          if (res && call.bodyState !== "streaming")
+            await captureResponseBody(req, res, call);
+          else if (!res && call.completion !== "stopped") {
+            call.bodyState = "unavailable";
+            call.bodyNote = "响应对象不可读取。";
+          }
+          s.dirty = true;
+          await frameTasks.get(req)?.catch(() => {
+            call.association = "unknown";
+          });
+          finishRequest(s.run, call);
+        } finally {
+          s.pendingNetwork.delete(req);
+          calls.delete(req);
+          frameTasks.delete(req);
         }
-        s.dirty = true;
-        finishRequest(s.run, call);
-        calls.delete(req);
       })(),
     );
   });
   s.context.on("requestfailed", (req) => {
+    const navigation = navigationCalls.get(req);
+    if (
+      navigation &&
+      !(s.closing && req.failure()?.errorText.includes("ERR_ABORTED"))
+    ) {
+      navigation.failure = redactText(
+        req.failure()?.errorText || "页面导航失败",
+      );
+      s.dirty = true;
+    }
+    navigationCalls.delete(req);
     finishBusiness(req);
     const call = calls.get(req);
     if (!call) return;
     call.failure = redactText(req.failure()?.errorText || "请求失败");
-    if (s.closing && call.failure.includes("ERR_ABORTED")) {
+    const expectedEmpty =
+      call.failure.includes("ERR_ABORTED") &&
+      (call.status === 204 ||
+        call.status === 205 ||
+        (call.method === "HEAD" && call.status !== undefined));
+    if (expectedEmpty) {
+      // Chromium can report an aborted body for an HTTP response that explicitly
+      // carries no body. Preserve its status instead of fabricating a failure.
       call.failure = undefined;
+      call.completion = "complete";
+      call.bodyState = "empty";
+    } else if (s.closing && call.failure.includes("ERR_ABORTED")) {
+      call.failure = undefined;
+      call.completion = "stopped";
       call.bodyNote = "结束采集时主动中断未结束连接，不作为请求失败。";
-    }
+    } else if (call.completion !== "stopped") call.completion = "failed";
+    call.bodyState ??= "unavailable";
     call.duration = Date.now() - Date.parse(call.startedAt);
     finishRequest(s.run, call);
     calls.delete(req);
+    frameTasks.delete(req);
+    s.pendingNetwork.delete(req);
     s.dirty = true;
   });
+}
+const FULL_BODY_LIMIT = 262144;
+const MARKER_BODY_LIMIT = 2 * 1024 * 1024;
+function businessMarkers(body: unknown): Record<string, unknown> {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return {};
+  return Object.fromEntries(
+    Object.entries(body)
+      .filter(([key]) =>
+        /^(code|success|ok|status|message|msg|error|errors|errorMessage|reason)$/i.test(key),
+      )
+      .map(([key, value]) => {
+        const safe = redactObject(value);
+        return [
+          key,
+          typeof safe === "string"
+            ? safe.slice(0, 1000)
+            : safe && typeof safe === "object"
+              ? JSON.stringify(safe).slice(0, 1000)
+              : safe,
+        ];
+      }),
+  );
+}
+async function captureResponseBody(
+  req: Request,
+  res: Response,
+  call: NetworkCall,
+) {
+  const type = res.headers()["content-type"] || "";
+  if (call.status === 204 || call.status === 205 || call.method === "HEAD") {
+    call.bodyState = "empty";
+    return;
+  }
+  if (!/json|text\//.test(type)) {
+    call.bodyState = "not-applicable";
+    call.bodyNote = "非 JSON/文本响应，仅保留元数据。";
+    return;
+  }
+  const size = await req.sizes().catch(() => undefined);
+  const encoded = size?.responseBodySize;
+  const compressed =
+    !!res.headers()["content-encoding"] &&
+    res.headers()["content-encoding"] !== "identity";
+  let decoded: number | undefined;
+  if (compressed || encoded === undefined || encoded > FULL_BODY_LIMIT) {
+    try {
+      // Same-origin ResourceTiming exposes the decoded size without fetching a
+      // second copy. Match the exact URL and nearest request start, not merely
+      // the last entry when concurrent requests use the same endpoint.
+      decoded = await req.frame().evaluate(
+        ({ url, startedAt }) => {
+          const entries = performance.getEntriesByType(
+            "resource",
+          ) as PerformanceResourceTiming[];
+          const entry = entries
+            .filter(
+              (e) =>
+                e.name === url &&
+                Math.abs(performance.timeOrigin + e.startTime - startedAt) <
+                  1000,
+            )
+            .sort(
+              (a, b) =>
+                Math.abs(performance.timeOrigin + a.startTime - startedAt) -
+                Math.abs(performance.timeOrigin + b.startTime - startedAt),
+            )[0];
+          return entry?.decodedBodySize && entry.decodedBodySize > 0
+            ? entry.decodedBodySize
+            : undefined;
+        },
+        { url: req.url(), startedAt: req.timing().startTime },
+      );
+    } catch {
+      /* Service Worker/cross-origin timing may be unavailable. */
+    }
+  }
+  const knownSize = decoded ?? (!compressed ? encoded : undefined);
+  if (
+    (knownSize !== undefined && knownSize > MARKER_BODY_LIMIT) ||
+    (knownSize === undefined &&
+      encoded !== undefined &&
+      encoded > FULL_BODY_LIMIT)
+  ) {
+    call.bodyState = "unavailable";
+    call.bodyNote =
+      knownSize === undefined
+        ? "压缩正文超过 256KB且解压大小不可核验；未读取正文，业务结果待确认。"
+        : "正文超过 2MB采集上限；未读取正文，业务结果待确认。";
+    return;
+  }
+  const body = await res.body().catch(() => undefined);
+  if (!body) {
+    call.bodyState = "unavailable";
+    call.bodyNote = "响应正文不可读取。";
+    return;
+  }
+  if (body.length === 0) {
+    call.bodyState = "empty";
+    return;
+  }
+  if (body.length > MARKER_BODY_LIMIT) {
+    call.bodyState = "unavailable";
+    call.bodyNote =
+      "浏览器未暴露解压尺寸，实际正文超过 2MB；不保留正文，业务结果待确认。";
+    return;
+  }
+  const text = body.toString("utf8");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+    call.businessMarkers = businessMarkers(parsed);
+  } catch {
+    /* The sample below is text evidence, never a fabricated JSON marker. */
+  }
+  if (body.length > FULL_BODY_LIMIT) {
+    call.bodyState = "sampled";
+    call.bodyNote = "正文超过 256KB；仅保留脱敏顶层业务标记，不保留完整数据。";
+    if (parsed === undefined) {
+      call.responseBody = redactText(text.slice(0, 8192));
+      call.bodyNote =
+        "正文超过 256KB；仅保留前 8192字符文本样本，业务标记无法完整解析。";
+    }
+  } else {
+    call.bodyState = "captured";
+    call.responseBody = redactBody(text);
+  }
 }
 export async function startSession(input: {
   name: string;
@@ -689,6 +945,7 @@ export async function startSession(input: {
       acceptDownloads: true,
     });
     const run: Run = {
+      evidenceVersion: EVIDENCE_VERSION,
       id: randomUUID(),
       name: input.name,
       project: input.project,
@@ -704,6 +961,7 @@ export async function startSession(input: {
       archived: false,
       operations: [],
       requests: [],
+      pageObservations: [],
       logs: [],
       notes: [
         "接口请求仅录制 Fetch/XHR；页面文档、静态资源、WebSocket 和 EventSource 请求不纳入接口列表。",
@@ -720,8 +978,13 @@ export async function startSession(input: {
         filteredLogs: 0,
         mergedRequests: 0,
         mergedLogs: 0,
+        apiRequests: 0,
+        excludedApiRequests: 0,
+        staticRequests: 0,
       },
       analysis: { status: "NONE", findings: [] },
+      feedback: [],
+      feedbackCapture: { events: 0, discarded: 0, truncated: 0 },
     };
     mkdirSync(resolve(dataRoot, "artifacts", run.id), { recursive: true });
     const s: Session = {
@@ -729,7 +992,10 @@ export async function startSession(input: {
       browser,
       context,
       pages: new Map(),
+      operationFrames: new Map(),
+      feedbackLocations: new Map(),
       closing: false,
+      pendingNetwork: new Set(),
       tasks: new Set(),
       dirty: false,
       flushTimer: setInterval(() => {}, 1000),
@@ -765,6 +1031,14 @@ export async function startSession(input: {
     await context.exposeBinding("__healthEmit", (source, event) => {
       if (run.mode === "replay") {
         if (
+          event.kind === s.current?.kind &&
+          source.page ===
+            [...s.pages.entries()].find(
+              ([, id]) => id === s.current!.pageId,
+            )?.[0]
+        )
+          s.operationFrames.set(s.current!.id, source.frame);
+        if (
           event.kind === "click" &&
           s.current?.kind === "click" &&
           source.page ===
@@ -775,13 +1049,102 @@ export async function startSession(input: {
           s.deliveredClicks.add(s.current.id);
         return;
       }
-      s.eventChain = s.eventChain.then(() =>
-        addOperation(s, source.page, source.frame, event),
-      );
+      s.eventChain = s.eventChain
+        .catch(() => {})
+        .then(() => addOperation(s, source.page, source.frame, event));
       tracked(s, s.eventChain);
     });
+    await context.exposeBinding("__healthFeedback", (source, event) => {
+      if (
+        s.feedbackClosed ||
+        s.run.status === "PAUSED" ||
+        !event ||
+        typeof event !== "object"
+      )
+        return;
+      if (event.kind === "limit") {
+        const note = redactText(
+          String(event.reason || "页面反馈达到采集限额。"),
+        ).slice(0, 200);
+        if (!run.notes.includes(note)) run.notes.push(note);
+        s.dirty = true;
+        return;
+      }
+      const feedbackTask = s.eventChain
+        .catch(() => {})
+        .then(async () => {
+          if (s.feedbackClosed || s.run.status === "PAUSED") return;
+          const id = pageId(s, source.page);
+          const timestamp = Date.parse(event.timestamp);
+          if (
+            !Number.isFinite(timestamp) ||
+            Math.abs(Date.now() - timestamp) > 60_000
+          )
+            return;
+          let value = { ...event };
+          if (event.kind === "url" || event.kind === "title") {
+            const state = s.feedbackLocations.get(source.frame) || {};
+            const after =
+              event.kind === "url"
+                ? redactFeedbackUrl(String(event.after || ""))
+                : redactText(String(event.after || ""));
+            const before =
+              event.change === "initial" ||
+              (event.kind === "title" && !event.before)
+                ? state[event.kind as "url" | "title"]
+                : event.before;
+            state[event.kind as "url" | "title"] = after;
+            s.feedbackLocations.set(source.frame, state);
+            if (
+              before === undefined ||
+              before === after ||
+              (event.kind === "url" && (!after || isStaticAssetUrl(after)))
+            )
+              return;
+            value = { ...value, change: "changed", before, after };
+          }
+          const candidates = new Set<string>();
+          for (const op of run.operations)
+            if (
+              !s.closing &&
+              s.operationFrames.get(op.id) === source.frame &&
+              !["hover", "scroll", "assert"].includes(op.kind) &&
+              !["BLOCKED", "SKIPPED"].includes(op.status) &&
+              Date.parse(op.timestamp) <= timestamp &&
+              timestamp - Date.parse(op.timestamp) < 5000
+            )
+              candidates.add(op.id);
+          for (const req of run.requests) {
+            if (
+              !req.stepId ||
+              s.operationFrames.get(req.stepId) !== source.frame ||
+              !["fetch", "xhr"].includes(req.resourceType)
+            )
+              continue;
+            const end = Date.parse(req.startedAt) + (req.duration || 0);
+            if (
+              req.completion === "pending" ||
+              (req.duration !== undefined &&
+                Math.abs(timestamp - end) < 1500 &&
+                (!s.closingAt || end >= s.closingAt))
+            )
+              candidates.add(req.stepId);
+          }
+          const path = await framePath(source.frame).catch(() => [
+            "[frame不可定位]",
+          ]);
+          captureFeedback(run, value, {
+            pageId: id,
+            framePath: path,
+            candidateStepIds: [...candidates].slice(-10),
+          });
+          s.dirty = true;
+        });
+      tracked(s, feedbackTask);
+      return feedbackTask;
+    });
     await context.addInitScript({
-      content: `(() => { const __name = (fn) => fn; (${installCollector.toString()})(); })();`,
+      content: `(() => { const __name = (fn) => fn; (${installCollector.toString()})(); (${installFeedbackCollector.toString()})(); })();`,
     });
     if (input.flow) {
       void replay(s, input.flow).catch(async (error) => {
@@ -820,8 +1183,17 @@ async function finishSession(
   status: Run["status"],
   reason?: string,
 ) {
-  if (s.closing) return;
+  if (s.finishPromise) return s.finishPromise;
+  s.finishPromise = finishSessionOnce(s, status, reason);
+  return s.finishPromise;
+}
+async function finishSessionOnce(
+  s: Session,
+  status: Run["status"],
+  reason?: string,
+) {
   s.closing = true;
+  s.closingAt = Date.now();
   s.canceled = true;
   if (status === "INTERRUPTED" && s.run.mode === "replay") {
     const running = [...s.run.operations]
@@ -851,13 +1223,54 @@ async function finishSession(
     [...s.dialogs.values()].map((d) => d.dialog.dismiss()),
   );
   s.run.pendingDialog = undefined;
+  // A request with HTTP headers is still incomplete while its body is in flight.
+  // Drain existing calls and tasks within a bounded stop window; keep collecting
+  // their responses while new requests/actions are excluded by s.closing.
+  const deadline = Date.now() + 3500;
+  while ((s.pendingNetwork.size || s.tasks.size) && Date.now() < deadline)
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  for (const req of s.run.requests)
+    if (
+      req.completion === "pending" ||
+      (!req.completion && !req.status && !req.failure)
+    ) {
+      req.completion = "stopped";
+      req.bodyState = "unavailable";
+      req.bodyNote =
+        "停止等待窗口结束时请求仍未完成，HTTP状态不代表正文或业务结果已取证。";
+      req.duration = Date.now() - Date.parse(req.startedAt);
+      if (req.events?.length === 1)
+        Object.assign(req.events[0], {
+          duration: req.duration,
+          status: req.status,
+        });
+    }
+  await Promise.race([
+    Promise.allSettled(
+      s.context.pages().flatMap((p) =>
+        p.frames().map((f) =>
+          f
+            .evaluate(async () => {
+              await (
+                window as unknown as {
+                  __healthFeedbackFlush?: () => Promise<void>;
+                }
+              ).__healthFeedbackFlush?.();
+            })
+            .catch(() => {}),
+        ),
+      ),
+    ),
+    new Promise((resolve) => setTimeout(resolve, 1000)),
+  ]);
+  s.feedbackClosed = true;
+  await s.browser.close().catch(() => {});
+  // Closing can emit requestfailed and reject body/header reads. Settle those
+  // callbacks before the final snapshot is written to SQLite.
   await Promise.race([
     Promise.allSettled([...s.tasks]),
-    new Promise((r) => setTimeout(r, 3500)),
+    new Promise((resolve) => setTimeout(resolve, 500)),
   ]);
-  for (const req of s.run.requests)
-    if (!req.status && !req.failure) req.bodyNote = "停止时请求未结束。";
-  await s.browser.close().catch(() => {});
   s.run.status = status;
   s.run.endedAt = now();
   finalizeReport(s.run);
@@ -883,10 +1296,15 @@ export async function stopSession(id: string, reason?: string) {
       s.context.pages().flatMap((p) =>
         p.frames().map((f) =>
           f
-            .evaluate(() => {
+            .evaluate(async () => {
               (
                 window as unknown as { __healthFlush?: () => void }
               ).__healthFlush?.();
+              await (
+                window as unknown as {
+                  __healthFeedbackFlush?: () => Promise<void>;
+                }
+              ).__healthFeedbackFlush?.();
             })
             .catch(() => {}),
         ),
@@ -1073,9 +1491,11 @@ async function resolveLocator(
       matches.set(`${hint.kind}: ${hint.value}`, count);
       if (
         count === 1 &&
-        (op.kind === "hover" || op.kind === "scroll" ||
+        (op.kind === "hover" ||
+          op.kind === "scroll" ||
           (await loc.isEnabled().catch(() => false)))
-      ) return loc;
+      )
+        return loc;
     }
     if (imageRoot && op.position) {
       const images = scope.locator(`${imageRoot} img`);
@@ -1225,10 +1645,7 @@ async function waitForBusinessIdle(s: Session, page: Page, op: Operation) {
     if (page.isClosed()) throw new Error("等待页面就绪时目标页签已关闭。");
     const network = s.replayNetwork.state(op.pageId);
     const pending = network.pending;
-    lastActivity = Math.max(
-      lastActivity,
-      network.lastActivity,
-    );
+    lastActivity = Math.max(lastActivity, network.lastActivity);
     const state = await page
       .evaluate(() => ({
         loaded: document.readyState === "complete",
@@ -1341,6 +1758,7 @@ async function replay(s: Session, flow: Flow) {
         : undefined;
     try {
       if (page.isClosed()) throw new Error("目标页签已关闭。");
+      s.operationFrames.set(op.id, page.mainFrame());
       if (op.kind === "goto") {
         const destination = variableValue(s, op.value || op.url);
         // Old recordings also contain navigation effects. Reuse an already
@@ -1417,6 +1835,12 @@ async function replay(s: Session, flow: Flow) {
               }
             : undefined;
         const loc = await resolveLocator(page, op, restoreHover);
+        if (op.framePath.length) {
+          const handle = await loc.elementHandle().catch(() => null);
+          const frame = await handle?.ownerFrame().catch(() => null);
+          if (frame) s.operationFrames.set(op.id, frame);
+          await handle?.dispose();
+        }
         switch (op.kind) {
           case "hover":
             await loc.hover({

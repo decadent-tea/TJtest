@@ -2217,6 +2217,13 @@ a:focus-visible {
   filter: brightness(1.18);
   transform: translateY(-2px);
 }
+.analysis-trigger-repeat,
+.analysis-trigger:is(:hover, :focus-visible) .analysis-trigger-completed {
+  display: none;
+}
+.analysis-trigger:is(:hover, :focus-visible) .analysis-trigger-repeat {
+  display: inline;
+}
 .analysis-trigger-shell[data-running="true"] .analysis-trigger:disabled {
   opacity: 1;
 }
@@ -2521,12 +2528,17 @@ a:focus-visible {
 .result-heading {
   scroll-margin-top: 110px;
   display: flex;
+  flex-wrap: wrap;
   align-items: start;
-  justify-content: space-between;
+  justify-content: flex-start;
   gap: 12px;
   margin-top: 30px;
   margin-bottom: 16px;
   overflow-wrap: anywhere;
+}
+.result-heading > :is(h2, h3, h4, h5) {
+  flex-basis: 100%;
+  min-width: 0;
 }
 .result-heading[data-level="1"] {
   border-top: 1px solid var(--border);
@@ -2663,6 +2675,8 @@ a:focus-visible {
   overflow: hidden;
   min-height: 56px;
   min-width: 198px;
+  max-width: 100%;
+  height: auto;
   padding: 7px 9px 7px 13px;
   gap: 13px;
   border-radius: 12px;
@@ -2683,18 +2697,54 @@ a:focus-visible {
     border-color 0.3s;
 }
 .inspection-result-trigger::before {
+  content: none;
+}
+.analysis-controls .inspection-result-trigger[data-ai-complete="true"] {
+  border-color: color-mix(in srgb, var(--primary) 50%, var(--border));
+  background: linear-gradient(
+    115deg,
+    color-mix(in srgb, var(--primary) 12%, var(--card)),
+    color-mix(in srgb, var(--primary) 25%, var(--card)) 52%,
+    color-mix(in srgb, var(--primary) 12%, var(--card))
+  );
+}
+.inspection-result-trigger[data-ai-complete="true"]::before {
   content: "";
   position: absolute;
   inset: 0;
   z-index: -1;
   background: linear-gradient(
     110deg,
-    transparent 35%,
-    color-mix(in srgb, var(--primary) 7%, transparent) 50%,
-    transparent 65%
+    transparent 20%,
+    color-mix(in srgb, var(--card) 65%, transparent) 43%,
+    color-mix(in srgb, var(--primary) 24%, transparent) 57%,
+    transparent 80%
   );
-  animation: intelligence-sweep 6s ease-in-out infinite;
+  animation: report-result-shimmer 4.8s ease-in-out infinite;
   pointer-events: none;
+}
+@keyframes report-result-shimmer {
+  0% {
+    transform: translateX(-110%);
+    opacity: 0;
+  }
+  12% {
+    opacity: 1;
+  }
+  76% {
+    transform: translateX(110%);
+    opacity: 1;
+  }
+  100% {
+    transform: translateX(110%);
+    opacity: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .inspection-result-trigger[data-ai-complete="true"]::before {
+    animation: none;
+    opacity: 0;
+  }
 }
 .inspection-result-trigger .result-trigger-paper {
   position: relative;
@@ -2702,6 +2752,7 @@ a:focus-visible {
   place-items: center;
   width: 30px;
   height: 35px;
+  flex-shrink: 0;
   border-radius: 5px 9px 5px 5px;
   border: 1px solid color-mix(in srgb, var(--primary) 22%, var(--border));
   background: var(--card);
@@ -2710,6 +2761,10 @@ a:focus-visible {
   transition: transform 0.35s;
 }
 .inspection-result-trigger .result-trigger-label {
+  min-width: 0;
+  white-space: normal;
+  text-align: left;
+  line-height: 1.45;
   font-weight: 650;
   letter-spacing: 0.5px;
 }
@@ -2718,6 +2773,7 @@ a:focus-visible {
   place-items: center;
   width: 32px;
   height: 32px;
+  flex-shrink: 0;
   margin-left: 9px;
   border-left: 1px solid color-mix(in srgb, var(--primary) 16%, transparent);
   transition:

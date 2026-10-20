@@ -5,6 +5,33 @@ import type {
   StepStatus,
   Finding,
 } from "../shared/types";
+import {
+  countOf,
+  endpoint,
+  isStaticAssetUrl,
+  isExcludedRequest,
+  isExcludedResourceLog,
+  requestStats,
+  findingObservation,
+  hasRepeatedRequest,
+  responseMarkers,
+  semanticIdentity,
+  constrainRiskClaim,
+  feedbackText,
+  requestProblem,
+  SLOW_REQUEST_THRESHOLD_MS,
+} from "../shared/inspection-evidence";
+import { groundFinding } from "./evidence-grounding";
+import { summarizeVerifiedFindings } from "../shared/analysis-summary";
+import { describeFinding } from "../shared/finding-details";
+import { requestPossibleCause } from "../shared/finding-cause";
+export {
+  countOf,
+  endpoint,
+  isStaticAssetUrl,
+  requestProblem,
+  SLOW_REQUEST_THRESHOLD_MS,
+} from "../shared/inspection-evidence";
 
 export const statusLabel: Record<StepStatus, string> = {
   RECORDED: "已录制，待验证",
@@ -15,130 +42,212 @@ export const statusLabel: Record<StepStatus, string> = {
   BLOCKED: "阻塞",
   SKIPPED: "跳过",
 };
-export const countOf = (item: { occurrences?: number }) =>
-  item.occurrences || 1;
-export const SLOW_REQUEST_THRESHOLD_MS = 10_000;
-export const isStaticAssetUrl = (value: string) => {
-  let pathname = value;
-  try {
-    pathname = new URL(value).pathname;
-  } catch {
-    /* Preserve malformed URLs for the remaining checks. */
-  }
-  return (
-    /\.(?:m?js|cjs|css|map|png|jpe?g|gif|svg|ico|webp|avif|woff2?|ttf|eot|mp[34]|webm)(?:$|[?#])/i.test(
-      pathname,
-    ) ||
-    /\/(?:static|assets|dist)\/(?:js|css|media|fonts?)\//i.test(pathname) ||
-    /\/(?:chunk|runtime|vendor)[^/]*\.(?:m?js|css)$/i.test(pathname)
-  );
-};
 export const isSuccessfulStaticAsset = (request: NetworkCall) =>
   isStaticAssetUrl(request.url) &&
   !request.failure &&
   !!request.status &&
   request.status < 400;
 
-// A single presentation set for the UI, exports and summary counts. Once AI has
-// assessed all evidence, its decisions replace provisional rule observations.
+// Rules remain authoritative; AI can explain the same evidence without deleting it.
 export function finalFindings(run: Run): Finding[] {
-  const candidates =
-    run.analysis.status === "COMPLETED"
-      ? run.analysis.findings
-      : [
-          ...run.analysis.findings,
-          ...run.findings.filter(
-            (f) =>
-              !run.analysis.findings.some((a) =>
-                a.evidenceIds.some((id) => f.evidenceIds.includes(id)),
-              ),
-          ),
-        ];
+  const aiFindings: Finding[] = run.analysis.findings.flatMap((stored) => {
+    if (stored.deleted) return [];
+    const checked = groundFinding(run, stored);
+    return checked
+      ? [
+          {
+            ...checked,
+            id: stored.id,
+            source: "ai" as const,
+            explanationSource: "ai" as const,
+            ...(stored.ownershipSource === "manual"
+              ? { owners: stored.owners, ownershipSource: "manual" as const }
+              : {}),
+          },
+        ]
+      : [];
+  });
+  const explained = new Set<string>();
+  const candidates: Finding[] = [];
+  const combined = new Map<string, Finding>();
+  const rank = { high: 3, medium: 2, low: 1 };
+  for (const rule of run.findings) {
+    const ai = aiFindings.find(
+      (item) =>
+        item.module === rule.module &&
+        (item.category === rule.category ||
+          [item.category, rule.category].every((category) =>
+            ["frontend", "interface", "functional", "stability"].includes(
+              category || "",
+            ),
+          )) &&
+        rule.evidenceIds.length > 0 &&
+        rule.evidenceIds.every((id) => item.evidenceIds.includes(id)),
+    );
+    if (!ai) {
+      candidates.push(rule);
+      continue;
+    }
+    explained.add(ai.id);
+    const previous = combined.get(ai.id);
+    if (previous) {
+      // Keep separately reviewed rows when merging would lose a tester's
+      // disposition or conflict with a manually confirmed owner.
+      if (
+        rule.note ||
+        (rule.disposition && rule.disposition !== "open") ||
+        (rule.ownershipSource === "manual" &&
+          previous.ownershipSource === "manual" &&
+          JSON.stringify(rule.owners) !== JSON.stringify(previous.owners))
+      ) {
+        candidates.push({
+          ...rule,
+          ...ai,
+          id: rule.id,
+          source: "rule",
+          explanationSource: "ai",
+          deleted: rule.deleted,
+          disposition: rule.disposition,
+          note: rule.note,
+          severity:
+            rank[rule.severity] > rank[ai.severity]
+              ? rule.severity
+              : ai.severity,
+          owners: rule.ownershipSource === "manual" ? rule.owners : ai.owners,
+          ownershipSource:
+            rule.ownershipSource === "manual" ? "manual" : ai.ownershipSource,
+        });
+        continue;
+      }
+      previous.evidenceIds = [
+        ...new Set([...previous.evidenceIds, ...rule.evidenceIds]),
+      ];
+      if (rank[rule.severity] > rank[previous.severity])
+        previous.severity = rule.severity;
+      if (rule.ownershipSource === "manual") {
+        previous.owners = rule.owners;
+        previous.ownershipSource = "manual";
+      } else if (previous.ownershipSource !== "manual") {
+        previous.owners = [
+          ...new Set([...(previous.owners || []), ...(rule.owners || [])]),
+        ].filter((owner) => owner !== "undetermined");
+      }
+      continue;
+    }
+    const result: Finding = {
+      ...rule,
+      ...ai,
+      id: rule.id,
+      source: "rule",
+      explanationSource: "ai",
+      deleted: rule.deleted,
+      disposition: rule.disposition,
+      note: rule.note,
+      severity:
+        rank[rule.severity] > rank[ai.severity] ? rule.severity : ai.severity,
+      evidenceIds: [...new Set([...rule.evidenceIds, ...ai.evidenceIds])],
+      owners:
+        rule.ownershipSource === "manual"
+          ? rule.owners
+          : ai.ownershipSource === "manual"
+            ? ai.owners
+            : [
+                ...new Set([...(ai.owners || []), ...(rule.owners || [])]),
+              ].filter((owner) => owner !== "undetermined"),
+      ownershipSource:
+        rule.ownershipSource === "manual" ? "manual" : ai.ownershipSource,
+    };
+    combined.set(ai.id, result);
+    candidates.push(result);
+  }
+  candidates.push(
+    ...aiFindings.filter((finding) => !explained.has(finding.id)),
+  );
   return candidates
     .filter(
       (f) =>
         !f.deleted &&
         findingHasRelevantEvidence(run, f) &&
-        !isBelowPerformanceThreshold(run, f),
+        !isBelowPerformanceThreshold(run, f) &&
+        !(
+          f.source === "ai" &&
+          /重复|冗余|频繁|高频/.test(f.title) &&
+          (() => {
+            const requests = run.requests.filter(
+              (r) => f.evidenceIds.includes(r.id) && !isExcludedRequest(r),
+            );
+            return requests.length > 0 && !hasRepeatedRequest(requests);
+          })()
+        ),
     )
+    .map((f) => (f.source === "ai" ? constrainRiskClaim(run, f) : f))
+    .map((f) =>
+      f.source === "ai" &&
+      /重复|冗余|频繁|高频/.test(f.title) &&
+      run.requests.some(
+        (r) => f.evidenceIds.includes(r.id) && !isExcludedRequest(r),
+      )
+        ? {
+            ...f,
+            title: "关联操作内出现多次同类请求，需核查",
+            confidence: "low" as const,
+            impact: "时间关联与调用次数不足以确认重复提交或多余负载。",
+            possibleCause: "需核对该端点的重试、刷新及操作约定。",
+          }
+        : f,
+    )
+    .map((f) => describeFinding(run, f))
+    .map((f) => ({
+      ...f,
+      observation: findingObservation(run, f),
+      ...(f.source === "ai"
+        ? {
+            title: f.title.replace(
+              /\d+(?:\.\d+)?\s*(?:次|毫秒|ms|秒|%)/gi,
+              "（数值见观察事实）",
+            ),
+            detail: `观察事实：${findingObservation(run, f)}\n业务影响（AI建议）：${f.impact || "待核查"}\n可能原因（AI建议）：${f.possibleCause || "未明确"}`,
+          }
+        : {}),
+    }))
     .sort(
       (a, b) =>
         ({ high: 3, medium: 2, low: 1 })[b.severity] -
         { high: 3, medium: 2, low: 1 }[a.severity],
     );
 }
-export function riskSummary(run: Run) {
-  const findings = finalFindings(run);
+export function riskSummary(run: Run, findings = finalFindings(run)) {
   return `高风险 ${findings.filter((f) => f.severity === "high").length} 项、中风险 ${findings.filter((f) => f.severity === "medium").length} 项、低风险 ${findings.filter((f) => f.severity === "low").length} 项。`;
 }
-export function analysisNarrative(run: Run) {
-  const findings = finalFindings(run);
-  let text = run.analysis.summary || "";
-  for (const [severity, label] of [
-    ["high", "高风险"],
-    ["medium", "中风险"],
-    ["low", "低风险"],
-  ] as const) {
-    const count = findings.filter((f) => f.severity === severity).length;
-    text = text
-      .replace(
-        new RegExp(
-          `(${label}(?:问题)?[：:\\s]*)(\\d+|零)(\\s*(?:项|个|条)?)`,
-          "g",
-        ),
-        (_, prefix, _old, suffix) => `${prefix}${count}${suffix}`,
-      )
-      .replace(
-        new RegExp(`(\\d+|零)(\\s*(?:项|个|条)?\\s*${label})`, "g"),
-        (_, _old, suffix) => `${count}${suffix}`,
-      );
-    if (count)
-      text = text.replace(
-        new RegExp(`(?:未发现|不存在|没有)${label}(?:问题)?`, "g"),
-        `发现 ${count} 项${label}问题`,
-      );
-  }
-  return text;
+export function analysisNarrative(run: Run, findings = finalFindings(run)) {
+  return summarizeVerifiedFindings(run, findings).summary;
 }
-export const interfaceTotal = (run: Run) => {
-  const retainedStatic = run.requests
-    .filter((r) => isStaticAssetUrl(r.url))
-    .reduce((sum, item) => sum + countOf(item), 0);
-  return run.captureStats
-    ? Math.max(
-        0,
-        run.captureStats.requests -
-          run.captureStats.filteredRequests -
-          retainedStatic,
-      )
-    : run.requests
-        .filter((item) => !isStaticAssetUrl(item.url))
-        .reduce((sum, item) => sum + countOf(item), 0);
-};
+export function analysisConclusion(run: Run, findings = finalFindings(run)) {
+  return summarizeVerifiedFindings(run, findings).conclusion;
+}
+export const interfaceTotal = (run: Run) => requestStats(run).calls;
 export const isConsoleLog = (log: LogEvent) =>
   log.level !== "sse" && !log.text.startsWith("触发下载：");
 export const consoleTotal = (run: Run) => {
-  const auxiliary = run.logs
-    .filter((log) => !isConsoleLog(log))
+  return run.logs
+    .filter((log) => isConsoleLog(log) && !isExcludedResourceLog(log))
     .reduce((sum, log) => sum + countOf(log), 0);
-  return run.captureStats
-    ? Math.max(0, run.captureStats.logs - auxiliary)
-    : run.logs.filter(isConsoleLog).reduce((sum, log) => sum + countOf(log), 0);
 };
 export const findingHasRelevantEvidence = (run: Run, finding: Finding) =>
   finding.evidenceIds.some(
     (id) =>
       run.operations.some((item) => item.id === id) ||
-      run.logs.some((item) => item.id === id) ||
-      run.requests.some(
-        (item) => item.id === id && !isStaticAssetUrl(item.url),
-      ),
+      run.logs.some((item) => item.id === id && !isExcludedResourceLog(item)) ||
+      (run.pageObservations || []).some((item) => item.id === id) ||
+      (run.feedback || []).some((item) => item.id === id) ||
+      run.requests.some((item) => item.id === id && !isExcludedRequest(item)),
   );
 export const isBelowPerformanceThreshold = (run: Run, finding: Finding) => {
+  if (finding.metricScope && finding.metricScope !== "requestDuration")
+    return false;
   if (
-    !/性能|响应时间|响应较慢|耗时|瓶颈/.test(
-      `${finding.title}${finding.detail}`,
-    )
+    finding.category !== "performance" &&
+    !/性能|响应时间|响应较慢|耗时|瓶颈/.test(finding.title)
   )
     return false;
   const evidence = finding.evidenceIds.flatMap((id) => {
@@ -154,37 +263,6 @@ export const isBelowPerformanceThreshold = (run: Run, finding: Finding) => {
     ) <= SLOW_REQUEST_THRESHOLD_MS
   );
 };
-export const endpoint = (url: string) => {
-  try {
-    const u = new URL(url);
-    return u.origin + u.pathname;
-  } catch {
-    return url.split("?")[0];
-  }
-};
-export function requestProblem(r: NetworkCall): string | undefined {
-  if (r.failure) return `网络失败：${r.failure}`;
-  if (r.status && r.status >= 400) return `HTTP ${r.status}`;
-  try {
-    const body = JSON.parse(r.responseBody || "null");
-    if (
-      body &&
-      typeof body === "object" &&
-      !Array.isArray(body) &&
-      (body.success === false || body.ok === false)
-    )
-      return "业务返回失败标记，需核对业务约定";
-  } catch {
-    /* Non-JSON bodies have no standard business success marker. */
-  }
-  if (
-    (r.maxDuration ?? r.duration ?? 0) > SLOW_REQUEST_THRESHOLD_MS &&
-    ["xhr", "fetch"].includes(r.resourceType) &&
-    r.category !== "background"
-  )
-    return `接口耗时超过 ${SLOW_REQUEST_THRESHOLD_MS}ms`;
-  return undefined;
-}
 export const importantLog = (l: LogEvent) =>
   ["error", "pageerror", "unhandledrejection", "warn", "warning"].includes(
     l.level,
@@ -200,11 +278,22 @@ const stats = (run: Run) =>
   });
 const fingerprints = new WeakMap<Run, Map<string, NetworkCall>>();
 export function finishRequest(run: Run, call: NetworkCall) {
+  if (call.events?.length === 1)
+    Object.assign(call.events[0], {
+      duration: call.duration,
+      status: call.status,
+      failure: call.failure,
+    });
   const s = stats(run);
   const remove = () => {
     const i = run.requests.indexOf(call);
     if (i >= 0) run.requests.splice(i, 1);
   };
+  if (isExcludedRequest(call)) {
+    remove();
+    s.filteredRequests += countOf(call);
+    return;
+  }
   if (
     !requestProblem(call) &&
     call.status !== undefined &&
@@ -219,11 +308,13 @@ export function finishRequest(run: Run, call: NetworkCall) {
   ) {
     remove();
     s.filteredRequests++;
+    if (s.excludedApiRequests !== undefined) s.excludedApiRequests++;
     return;
   }
   // Exact payload comparison: different query values, bodies, pages and steps remain distinct.
   const key = JSON.stringify([
     call.pageId,
+    call.framePath,
     call.stepId,
     call.method,
     call.url,
@@ -231,6 +322,9 @@ export function finishRequest(run: Run, call: NetworkCall) {
     call.status,
     call.failure,
     call.responseBody,
+    call.completion,
+    call.bodyState,
+    responseMarkers(call),
     requestProblem(call),
   ]);
   let index = fingerprints.get(run);
@@ -241,11 +335,19 @@ export function finishRequest(run: Run, call: NetworkCall) {
   const previous = index.get(key);
   if (previous && previous !== call) {
     previous.occurrences = countOf(previous) + 1;
-    previous.lastSeen = call.startedAt;
+    previous.lastSeen = [
+      previous.lastSeen || previous.startedAt,
+      call.lastSeen || call.startedAt,
+    ]
+      .sort()
+      .at(-1);
+    previous.startedAt = [previous.startedAt, call.startedAt].sort()[0];
     previous.maxDuration = Math.max(
       previous.maxDuration ?? previous.duration ?? 0,
       call.duration ?? 0,
     );
+    if (call.events)
+      previous.events = [...(previous.events || []), ...call.events];
     remove();
     s.mergedRequests++;
   } else index.set(key, call);
@@ -254,9 +356,10 @@ export function captureLog(run: Run, log: LogEvent) {
   const s = stats(run);
   s.logs++;
   if (
-    !importantLog(log) &&
-    log.level !== "sse" &&
-    !log.text.startsWith("触发下载：")
+    isExcludedResourceLog(log) ||
+    (!importantLog(log) &&
+      log.level !== "sse" &&
+      !log.text.startsWith("触发下载："))
   ) {
     s.filteredLogs++;
     return;
@@ -285,30 +388,43 @@ export function evidenceLabel(run: Run, ids: string[]) {
         if (r)
           return `${r.method} ${endpoint(r.url)}（${requestProblem(r) || `HTTP ${r.status ?? "未结束"}`}，${countOf(r)} 次）`;
         const l = run.logs.find((l) => l.id === id);
-        return l
-          ? `${l.level}：${l.text.slice(0, 240)}（${countOf(l)} 次）`
-          : "关联证据不可用";
+        if (l) return `${l.level}：${l.text.slice(0, 240)}（${countOf(l)} 次）`;
+        const feedback = run.feedback?.find((f) => f.id === id);
+        return feedback ? feedbackText(run, feedback) : "关联证据不可用";
       }),
     ),
   ].join("\n");
 }
-export function problemRequests(run: Run) {
+export function problemRequests(run: Run, findings = finalFindings(run)) {
   const groups = new Map<
     string,
-    { request: NetworkCall; reason: string; count: number; duration: number }
+    {
+      request: NetworkCall;
+      reason: string;
+      count: number;
+      duration: number;
+      evidenceIds: string[];
+    }
   >();
   for (const r of run.requests) {
     // A micro-frontend can fetch code chunks with Fetch/XHR. A successful chunk is
     // implementation transport, not a business interface or AI issue.
-    if (isStaticAssetUrl(r.url)) continue;
+    if (isExcludedRequest(r)) continue;
     // AI 引用了接口证据，只说明它分析过相关操作，不能推导为接口异常。
     // 这里仅展示由协议、业务返回或耗时规则直接证明的问题。
-    const ai = finalFindings(run).find(
+    const ai = findings.find(
       (f) => f.category === "interface" && f.evidenceIds.includes(r.id),
     );
     const reason = requestProblem(r) || ai?.observation || ai?.detail;
     if (!reason) continue;
-    const key = JSON.stringify([r.module, r.method, endpoint(r.url), reason]);
+    const key = JSON.stringify([
+      r.module,
+      r.method,
+      endpoint(r.url),
+      semanticIdentity(r),
+      responseMarkers(r),
+      reason,
+    ]);
     const existing = groups.get(key);
     if (existing) {
       existing.count += countOf(r);
@@ -316,12 +432,14 @@ export function problemRequests(run: Run) {
         existing.duration,
         r.maxDuration ?? r.duration ?? 0,
       );
+      existing.evidenceIds.push(r.id);
     } else
       groups.set(key, {
         request: r,
         reason,
         count: countOf(r),
         duration: r.maxDuration ?? r.duration ?? 0,
+        evidenceIds: [r.id],
       });
   }
   return [...groups.values()];
@@ -337,38 +455,41 @@ export function importantLogs(run: Run) {
   return [...groups.values()];
 }
 export function causeAdvice(r: NetworkCall) {
+  const cause =
+    requestPossibleCause(r) ||
+    "当前缺少具体失败信息，需补充失败响应或错误日志后分析可能原因。";
   if (r.failure)
     return {
-      cause:
-        "可能涉及网络连通性、跨域策略、证书或请求取消，需结合浏览器网络面板核查。",
+      cause,
       advice:
         "按发生时间检查网关及网络错误，复现相同操作并确认请求是否被主动取消。",
     };
   if (r.status === 401 || r.status === 403)
     return {
-      cause: "可能与会话失效或权限配置有关，需确认是否为预期鉴权测试。",
+      cause,
       advice: "核查登录态、令牌有效期与角色权限，补充失效会话及越权断言。",
     };
   if (r.status && r.status >= 500)
     return {
-      cause: "服务端或网关返回错误；具体异常及依赖故障需服务端日志确认。",
+      cause,
       advice:
         "按时间、接口和请求链路核查服务端异常与下游依赖，补充异常响应及重试验证。",
     };
   if (r.status && r.status >= 400)
     return {
-      cause: "可能为参数、路由或业务前置条件不满足，需核对接口约定。",
+      cause,
       advice: "检查参数校验、路由配置及业务前置条件，补充正向与负向用例。",
     };
   if (requestProblem(r)?.includes("耗时"))
     return {
-      cause: "本次耗时偏高；网络、查询或依赖延迟均需进一步测量。",
+      cause,
       advice:
         "重复采样并拆分网关、服务、数据库耗时，再评估索引、分页、缓存与超时策略。",
     };
   return {
-    cause: "存在业务失败标记，具体原因需核对业务返回约定和服务端日志。",
-    advice: "核查业务前置条件与错误处理，增加业务成功及失败分支断言。",
+    cause,
+    advice:
+      "后端按接口、参数和时间核查拒绝或异常分支，必要时与前端联查参数及登录态；确认是否属于预期负向测试，再复测正常输入与失败反馈。",
   };
 }
 export function detailedAnalysis(run: Run, overview: string) {

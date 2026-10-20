@@ -152,9 +152,18 @@ try {
       (i) => !String(i.data.url).includes("asset.JS"),
     ),
   );
-  assert.equal(finalFindings(run).length, 1);
-  assert.equal(finalFindings(run)[0].severity, "medium");
-  assert(riskSummary(run).includes("高风险 0 项、中风险 1 项"));
+  assert(
+    finalFindings(run).some(
+      (f) =>
+        f.source === "rule" &&
+        f.evidenceIds.some((id) =>
+          run.requests.some((r) => r.id === id && r.status === 500),
+        ),
+    ),
+    "AI不能抹除HTTP500规则事实",
+  );
+  assert(finalFindings(run).some((f) => f.severity === "high"));
+  assert(riskSummary(run).includes("高风险"));
   assert(run.analysis.conclusion);
   assert(run.analysis.caseDescriptions?.every((c) => c.verdict));
   const compressed = structuredClone(run);
@@ -230,7 +239,11 @@ try {
   active = replay.id;
   await wait(() => readRun(replay.id)?.status !== "REPLAYING");
   active = "";
-  assert.equal(readRun(replay.id)?.analysis.status, "NONE", "流程执行后不应自动分析");
+  assert.equal(
+    readRun(replay.id)?.analysis.status,
+    "NONE",
+    "流程执行后不应自动分析",
+  );
   assert(
     replay.operations.every((o) => ["EXECUTED", "PASSED"].includes(o.status)),
     JSON.stringify(replay.operations.filter((o) => o.status === "FAILED")),

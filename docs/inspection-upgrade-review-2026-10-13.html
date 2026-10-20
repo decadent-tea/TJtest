@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TJtest 体检平台升级讨论纪要</title>
+  <style>
+    *{box-sizing:border-box;font-family:SimSun,"宋体",serif!important;color:#000!important}
+    body{margin:0;background:#eee;font-size:16px;line-height:1.8}
+    main{max-width:1160px;margin:28px auto;padding:40px 48px;background:#fff;border:1px solid #bbb}
+    h1{font-size:28px;line-height:1.4;margin:0 0 16px}h2{font-size:22px;margin:32px 0 12px;border-bottom:1px solid #999;padding-bottom:8px}h3{font-size:18px;margin:22px 0 10px}
+    p{margin:10px 0}.meta{font-size:14px}.lead{border-left:4px solid #000;background:#f5f5f5;padding:14px 20px}
+    .table-wrap{overflow-x:auto}table{width:100%;border-collapse:collapse;margin:14px 0;font-size:14px;min-width:660px}th,td{padding:9px 11px;border:1px solid #aaa;vertical-align:top;text-align:left}th{background:#f0f0f0}
+    li{margin:6px 0}a{overflow-wrap:anywhere}code{overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f7f7f7;border:1px solid #bbb;padding:16px;font-size:14px}
+    nav{border:1px solid #aaa;padding:12px 16px;margin:22px 0}nav a{display:inline-block;margin-right:18px}details{border:1px solid #bbb;padding:12px 16px;margin:12px 0}summary{cursor:pointer;font-weight:bold}
+    @media(max-width:760px){main{margin:0;padding:22px 18px}h1{font-size:24px}body{font-size:15px}}
+    @media print{@page{size:A4;margin:18mm}body{background:#fff;font-size:11pt}main{margin:0;padding:0;border:0;max-width:none}nav{display:none}.table-wrap{overflow:visible}table{min-width:0;font-size:9pt}tr{break-inside:avoid}thead{display:table-header-group}h2,h3{break-after:avoid}a{text-decoration:none}details{break-inside:avoid}}
+  </style>
+</head>
+<body><main>
+  <h1>TJtest 体检平台升级讨论纪要</h1>
+  <p class="meta">日期：2026-10-13（北京时间）｜项目：E:\codexProject\TjTest｜编制单位：北斗天地股份有限公司</p>
+  <p class="meta">状态：代码审查与方案评估。本文建议尚未开发；核验依据为当前源码、三个隔离内存诊断场景及官方 API 文档，未对实际被测业务网站执行测试。正文、表格及打印文本统一为黑色宋体。</p>
+  <div class="lead"><strong>建议把平台升级为“人工浏览 + 通用页面检查 + 证据关联 + 差异复检”。</strong>继续复用现有录制与回放基础，让用户正常点网站时，自动观察页面错误、持续加载、控件反馈、接口异常与实时通信。静态资源全部排除；复杂业务正确性由专项测试承担。</div>
+  <nav aria-label="文档目录"><a href="#scope">范围</a><a href="#meeting">会议结论</a><a href="#current">现状核验</a><a href="#checks">新增检测</a><a href="#collection">采集取舍</a><a href="#implementation">落地设计</a><a href="#roadmap">阶段验收</a></nav>
+
+  <h2 id="scope">一、目标与最新范围</h2>
+  <p>用户期望：自己正常点一遍网站，平台能自动暴露大部分已经触发的通用技术问题和界面问题，减少逐条编写断言；复杂业务计算、业务流程规则与工业控制结果不深入验证。</p>
+  <p><strong>用户补充的范围约束优先执行：JS、CSS、图片、字体等静态资源，无论成功或失败，均不录入体检证据，也不生成静态资源问题。</strong>推荐在录制入口过滤，避免读取正文、存储和送入 AI。当前 <code>server/recorder.ts:536–540</code> 已采用入口过滤，因此这项行为符合最新要求。</p>
+  <p>保留页面导航 URL、页签与 iframe 上下文，用于定位操作与页面表现；不扩展采集 document 响应正文。业务接口返回的附件、上传和导出动作应按业务行为定义范围，不能仅因文件后缀把它们误当静态资源。</p>
+  <p>可检测范围必须写为“本次访问和触发的页面状态”。未打开的菜单、未展开的弹窗、未触发的错误分支，以及只有另一角色才能看到的功能，不会通过一次浏览自动得到验证。应以受控故障样例与实际项目复核来衡量发现能力，不预先宣称全系统覆盖率。</p>
+
+  <h2 id="meeting">二、内部会议与收敛结果</h2>
+  <p>主 agent 负责总体架构和诊断复现，三个并行 agent 分别负责采集覆盖、信号质量、产品流程与路线。进行了源码审查和交叉质询，并在用户明确静态资源范围后统一修订结论。</p>
+  <div class="table-wrap"><table><thead><tr><th>讨论方向</th><th>主要观点</th><th>质询后采用的结论</th></tr></thead><tbody>
+    <tr><td>采集覆盖</td><td>仅网络与日志不足以知道用户看到什么；需要页面状态、控件反馈与帧内检查。</td><td>新增被动页面观察。白屏、无反馈、遮挡先作为候选；符合明确检查约定时才判检查失败。</td></tr>
+    <tr><td>信号质量</td><td>AI 不能抹掉已有事实；没有验证条件不能计通过；重复事件应压缩而非丢失位置。</td><td>事实、检查、问题分层。保留规则发现；AI补充解释和归类。异常聚合仍可回到每个发生位置。</td></tr>
+    <tr><td>产品流程</td><td>基础体检依赖 AI、覆盖指标不完整、误报只能删除，会影响可信度与复用。</td><td>基础报告独立于 AI；展示访问范围和检查执行范围；增加预期现象、误报与重复的反馈记录。</td></tr>
+    <tr><td>静态资源范围</td><td>首轮曾提出保留失败资源，用户明确全部不考虑。</td><td>撤回资源失败与坏图检测建议，保留入口过滤。纯资源加载日志也按范围排除。</td></tr>
+    <tr><td>主动测试深度</td><td>是否自动点击所有菜单、扩展输入边界和弱网测试？</td><td>首轮聚焦人工已访问范围的被动诊断；主动探测以后作为独立模式，不混入人工浏览。</td></tr>
+  </tbody></table></div>
+  <p>正常空列表、合法表单校验、相同查询结果、复制按钮、大屏数值暂时不变，均不能直接判缺陷。页面动作执行、通用检查通过、整个业务正确是三个不同结论。</p>
+
+  <h2 id="current">三、当前实现与需要优先处理的风险</h2>
+  <p>项目已经具有人工动作录制、截图、Fetch/XHR 采集、Console 与页面异常、SSE 消息采样、可编辑流程、回放、文本断言、AI 分批分析以及 Word/Excel 导出。其主要欠缺是独立的页面状态证据、通用检查模型和检查覆盖统计。截图虽然保存，本轮核对的 AI 输入仍为文本证据，未发送截图。</p>
+  <div class="table-wrap"><table><thead><tr><th>核验项</th><th>当前行为与代码位置</th><th>影响及建议</th></tr></thead><tbody>
+    <tr><td>AI 完成后覆盖规则发现</td><td><code>server/evidence-quality.ts:44–56</code> 在分析完成时仅取 <code>analysis.findings</code>。</td><td>模型遗漏可能导致规则发现消失。规则事实与检查结果应独立保留，模型无权凭遗漏删除。</td></tr>
+    <tr><td>证据不足仍计通过</td><td><code>server/report.ts:148–154</code> 根据 AI 完成状态将正常动作转为 PASSED；limited 也落为通过。<code>server/ai.ts:282</code> 的提示词要求二态判定。</td><td>通过率会包含未真正验证的步骤。动作状态与检查结果分开，证据不足保留“无法判断”。</td></tr>
+    <tr><td>基础结果依赖模型</td><td><code>src/components/inspection-result.tsx:70–80</code> 与 <code>workbench.tsx:631</code> 门控完整结果入口。</td><td>未配置模型或分析失败时也应能阅读规则结果、证据缺口和基础报告。</td></tr>
+    <tr><td>缺少页面状态证据</td><td><code>shared/types.ts:227</code> 的 Run 主要是 operations/requests/logs；<code>server/collector.ts</code> 主要收集动作、定位与位置。</td><td>Toast、弹窗状态、持续 loading、实际可见内容与控件变化未形成统一可判定证据。</td></tr>
+    <tr><td>iframe 文本断言作用域</td><td><code>server/recorder.ts:1368–1375、1488–1493</code> 使用顶层 <code>page.getByText</code>，未使用记录的 framePath。<code>scripts/verify-hover.ts:62</code> 移除了帧内断言。</td><td>帧内文本可能无法验证，也可能被顶层同名文本误满足。应与控件定位共用帧解析器；此项为源码确认，尚未运行专项复现。</td></tr>
+    <tr><td>接口约定和关联较弱</td><td><code>server/evidence-quality.ts:165–185</code> 仅通用识别 success/ok=false 和固定 10 秒慢请求；<code>recorder.ts:549、564、578</code> 关联最近动作并给固定置信度。</td><td>需要项目级成功码/错误码、端点阈值与多候选关联。时间相近只说明关联候选，不说明因果。</td></tr>
+    <tr><td>实时通信不完整</td><td><code>server/recorder.ts:417–435</code> 有 SSE 限量日志；当前代码未发现 WebSocket 监听。</td><td>监测、告警大屏需要连接与重连、消息计数和可配置新鲜度检查。</td></tr>
+    <tr><td>说明文档漂移</td><td><code>docs/使用说明.html:12、17</code> 仍描述静态资源保留、WebSocket 已采样，并保留较早的悬停/账号边界。</td><td>随功能升级同步修正能力说明；测试夹具的资源保留假设也应与最新范围一致。</td></tr>
+  </tbody></table></div>
+  <h3>本轮隔离诊断结果</h3>
+  <p>使用 PowerShell 7，通过 Node/tsx 导入当前报告规则，在内存构造示例记录；未调用模型、未读写实际体检库。以下三项来自实际运行输出。</p>
+  <pre>场景 1：HTTP 500 已产生规则发现，随后将 AI 状态设为 COMPLETED、AI findings=[]
+结果：finalFindings 数量从 1 变为 0。
+
+场景 2：已录制的“查询”步骤，AI caseDescriptions.verdict="limited"
+结果：最终用例 status="PASSED"。
+
+场景 3：HTTP 200，响应 {"code":500,"message":"保存失败"}，没有项目约定
+结果：requestProblem 返回空；通用规则不能判断该自定义业务码。</pre>
+  <p>场景 3 说明需要轻量接口约定：不能把所有系统的 code=500 都硬编码为失败，也不能单凭 HTTP 200 判正确。静态资源另做过过滤诊断，按用户最新范围属于预期排除，不纳入问题清单。</p>
+
+  <h2 id="checks">四、最值得新增的检测能力</h2>
+  <div class="table-wrap"><table><thead><tr><th>能力</th><th>自动观察什么</th><th>判定边界</th><th>优先级</th></tr></thead><tbody>
+    <tr><td>用户可见错误</td><td>role=alert、常见组件错误 Toast、错误弹窗、表单错误区；记录出现/消失时间、文本、所属帧与局部截图。</td><td>“不能为空”“权限不足”可能符合预期；无项目约定时标现象/候选，不能只凭“失败”关键词硬判。</td><td>第一期</td></tr>
+    <tr><td>持续加载和页面就绪</td><td>aria-busy、loading 遮罩、骨架区域、关联请求和主体可用状态；检查加载是否持续超时。</td><td>动态时钟与实时数据不能使页面永远“不稳定”；长导出任务与常规查询分开阈值。</td><td>第一期</td></tr>
+    <tr><td>操作反馈与轻量检查点</td><td>弹窗打开/关闭、页签选中、菜单展开、勾选变化、导航、提示、下载完成等。</td><td>无变化仅候选。查询结果相同、复制/焦点操作无法推断失败；用户确认少量关键结果锚点后可硬判。</td><td>第一期</td></tr>
+    <tr><td>页面主体异常</td><td>稳定后的主体内容摘要，连续采样发现空白主体、遮罩阻塞或错误占位。</td><td>正常空态、Canvas/WebGL、视频、SVG 和 iframe 主体不能靠文本为空判白屏；无明确主体期望时只标疑似。</td><td>第一期</td></tr>
+    <tr><td>列表与表单通用状态</td><td>表格错误区、loading 长时间未退、原生 validationMessage、无可用反馈等。</td><td>不做列表业务数量对账、复杂字段校验规则推断或保存数据正确性判定。</td><td>第一期</td></tr>
+    <tr><td>HTTP 200 内的失败</td><td>按项目配置解析成功码、success 字段、错误信息路径、内容类型；发现 JSON 接口返回登录 HTML 的候选。</td><td>项目规则确认前仅标待核对；未知协议、分页/GraphQL 错误应允许不同端点配置。</td><td>第二期</td></tr>
+    <tr><td>页面交互性能</td><td>输入/点击到下一次绘制的耗时、长任务、动作到结果就绪的耗时；分开接口耗时和页面耗时。</td><td>一次浏览形成当前设备和窗口的样本，不等同压力测试。记录前后台状态及采集器开销。</td><td>第二期</td></tr>
+    <tr><td>实时链路与数据新鲜度</td><td>WS/SSE 连接、关闭/错误、重连、消息速率和最后消息时间；按项目时间戳字段检查更新滞后。</td><td>无消息可能正常；数值相同不代表停更。需配置心跳或预期更新频率、业务时间戳和时钟口径。</td><td>第二期</td></tr>
+    <tr><td>下载与导出过程</td><td>下载触发、实际完成、失败原因、文件元数据；可选校验应为附件却收到登录页/错误页。</td><td>业务导出不同于页面静态资产。正文解析按项目需要开启，不默认校验报表业务内容。</td><td>第二期</td></tr>
+    <tr><td>基础可用性与视觉候选</td><td>控件标签/可访问名称，必要的遮挡、溢出、裁剪与键盘可达性检查。</td><td>横向滚动、ellipsis、地图浮层可能正常；视觉候选需截图复核。基线和多视口测试放后续。</td><td>第三期，可选</td></tr>
+  </tbody></table></div>
+  <p>页面变化可以使用 MutationObserver 通知，再结合动作、路由和弹窗事件进行节流采样；不需要持久化每条 DOM 变更。该 API 观察 DOM 树变化，参见 <a href="https://developer.mozilla.org/en-US/docs/Web/API/MutationObserver">MDN MutationObserver</a>。短暂 Toast 必须记录事件生命周期，不能只等待页面稳定后截图。</p>
+  <p>性能观察可使用 PerformanceObserver，先查询 supportedEntryTypes，支持不足就明确标记未采集。Event Timing 可提供部分交互的耗时观测；本方案的“动作到结果就绪”需要另外定义检查条件，不能混称为 INP。参见 <a href="https://developer.mozilla.org/en-US/docs/Web/API/PerformanceObserver">MDN PerformanceObserver</a>、<a href="https://developer.mozilla.org/en-US/docs/Web/API/PerformanceEventTiming">MDN PerformanceEventTiming</a>。</p>
+  <p>WebSocket 可沿用当前 Playwright 的页面事件入口添加监听，参见 <a href="https://playwright.dev/docs/api/class-page#page-event-web-socket">Playwright Page WebSocket 事件</a>。基础可用性后续可接入 axe，自动检查仍不能覆盖所有无障碍问题，参见 <a href="https://playwright.dev/docs/accessibility-testing">Playwright 无障碍测试</a>。这些资料支持技术可行性，项目优先级为本次会议判断。</p>
+
+  <h2 id="collection">五、保留、压缩与排除的采集信息</h2>
+  <div class="table-wrap"><table><thead><tr><th>信息</th><th>默认策略</th><th>原因及例外</th></tr></thead><tbody>
+    <tr><td>静态资源请求/正文/加载诊断</td><td>录制入口直接排除，成功失败一致；最多保留排除计数。</td><td>遵循用户明确范围；不送 AI，不做坏图/静态失败检查。</td></tr>
+    <tr><td>纯静态资源加载 Console</td><td>明确资源来源、静态 URL 与标准加载错误同时匹配时按范围排除。</td><td>不能仅凭日志位置以 .js 结尾就过滤；TypeError、ReferenceError、未捕获异常、业务 Fetch 错误仍属于运行时/接口证据。运行时失败不另建静态资源问题。</td></tr>
+    <tr><td>普通 log/info/debug</td><td>继续默认不持久化，保留计数；诊断模式按需开启。</td><td>当前已有降噪，不建议为了数据多而恢复全量日志。</td></tr>
+    <tr><td>错误、警告与异常栈</td><td>保留脱敏后的关键事实，重复项聚合，保留首末时间与发生位置。</td><td>框架警告按项目精确抑制；不能全局丢弃 warning，也不能把每条 warning 都当产品缺陷。</td></tr>
+    <tr><td>正常业务接口</td><td>保留端点、参数摘要、状态、耗时、业务码、响应结构/关键字段；成功列表正文默认抽样。</td><td>异常窗口、指定关键接口可以限额保留较完整脱敏正文；摘要不能声称全量数据已验证。</td></tr>
+    <tr><td>正常轮询与心跳</td><td>聚合计数、首末时间、耗时分布、成功率；异常前后保留有限代表事件。</td><td>监测接口不因 URL 包含 ping/metrics 就直接判无价值，应有项目角色与范围配置。</td></tr>
+    <tr><td>WS/SSE 正文</td><td>项目启用实时通信采集后，持续保存连接与消息统计；首样本、状态变化与异常窗口限额采样。</td><td>替代当前 SSE 每连接最多 500 条全文采样策略；保留采样/丢弃计数，避免高频遥测挤占证据。</td></tr>
+    <tr><td>截图</td><td>页面状态变化、关键反馈和异常时优先保存；重复画面去重，保留截图时间及与动作的差值。</td><td>人工录制无法保证每个动作同步前置截图；最近可用画面不冒充严格动作前截图。截图与 DOM 敏感字段策略需一致。</td></tr>
+    <tr><td>连续视频、完整 DOM、全部 mutation</td><td>默认关闭；仅独立诊断模式按需启用。</td><td>成本高、重复多。用页面摘要、异常局部 DOM 与必要截图支撑判定。</td></tr>
+    <tr><td>hover、输入、滚动</td><td>显示可聚合，输入合并；保留回放所需的关键顺序和容器信息。</td><td>菜单悬停和嵌套滚动会影响后续动作，不能为降噪直接删除有效操作。</td></tr>
+    <tr><td>采集缺口</td><td>显式记录截断、无法读取、暂停窗口、API 不支持和抽样范围。</td><td>当前部分提示写“完整内容保留本机”，但大正文/数组/深度可能已截断，必须改为真实完整度描述。</td></tr>
+  </tbody></table></div>
+  <p>稳定的去重应压缩展示和重复正文，同时保存 occurrence 索引。不同模块、不同业务码和不同影响不可强行合并；同一接口的共同候选原因可以聚成一个问题，但必须保留所有页面与步骤入口。</p>
+
+  <h2 id="implementation">六、适合现项目的落地设计</h2>
+  <h3>1. 三层数据与规则</h3>
+  <pre>人工操作 / 接口 / 日志 / 页面状态 / 实时连接
+                    ↓
+ObservedEvent：观测事实、时间、页签/帧、动作关联、采样完整度
+                    ↓
+CheckResult：规则 ID 与版本、适用条件、期望、实际、证据、执行状态
+                    ↓
+Finding：确认问题 / 疑似问题 / 预期现象；严重度与置信度分别记录
+                    ↓
+基础报告与问题中心 → AI 解释补充 → 同项目差异复检</pre>
+  <p>ObservedEvent 不因 AI 结果变化被改写。CheckResult 建议支持通过、失败、无法判断、不适用、未执行；“失败”表示检查约定未满足，“确定产品缺陷”还要确认该约定适用且不是预期负向测试。操作继续使用 RECORDED/EXECUTED 等执行状态。</p>
+  <p>HTTP 500 是确定的协议观测，是否构成产品缺陷依赖上下文。AI 可解释影响、建议核查原因、聚类相同现象，但不创造不存在的执行步骤或数值；将规则 ID、事实字段与证据 ID 结构化，耗时和状态码由本地数据生成。</p>
+  <h3>2. 项目轻配置与无配置首轮</h3>
+  <p>第一轮无需逐步写断言，先运行通用被动观察。结束后用已采证据推荐少量项目约定：成功码与错误字段、常见 Toast/遮罩、关键页面主体、查询/保存的少量结果锚点、实时更新频率和忽略规则。配置绑定项目与环境版本，在下一次录制和复检复用。</p>
+  <p>未知规则不硬判；自动建议不等于确认业务协议。实时大屏用路由、导航上下文、活跃页签和弹窗结构标识页面状态，数值变化作为观测数据，避免整页文本变化产生无限“新页面”。</p>
+  <h3>3. 证据关联、抑制与覆盖</h3>
+  <p>接口归属综合页签/帧、请求开始时间、动作窗口、可用 initiator 和页面状态；允许多候选与待确认归属。轮询/实时连接归页面或场景，避免挂到最近一次点击。当前固定 0.65/0.3 不应显示为经过验证的因果置信度。</p>
+  <p>问题指纹使用规则 ID、端点/错误签名、检查对象与约定版本；保留每次 occurrence 的模块、页面、动作和时间。误报、预期现象、重复问题记录原因、范围、规则版本与到期时间，后续匹配仍留计数和代表证据，避免删除后无法学习。</p>
+  <p>访问范围显示已到访的路由、菜单、页签和弹窗，以及已发现但未访问的入口；没有完整菜单基线就只报实际数量。检查范围显示适用检查的通过、失败、未知、未执行和证据缺失。检查通过率＝通过检查数 ÷（通过检查数＋失败检查数）；无法判断、不适用、未执行及证据不足不计入分母，另列数量。分母为零时显示“暂无可判定检查”；接口条数、动作条数都不能替代检查覆盖率。</p>
+  <h3>4. 增量实现入口</h3>
+  <div class="table-wrap"><table><thead><tr><th>现有位置</th><th>建议改动</th></tr></thead><tbody>
+    <tr><td><code>shared/types.ts</code></td><td>增加 PageObservation、CheckResult、Coverage 与 EvidenceCompleteness；新记录标证据 schema 版本，历史缺项标未采集。</td></tr>
+    <tr><td><code>server/collector.ts</code></td><td>扩展错误反馈、控件变化与页面摘要观察；采样节流、限额，短 Toast 记录生命周期。</td></tr>
+    <tr><td><code>server/recorder.ts</code></td><td>协调状态采样、截图、帧作用域、动作关联与实时连接；保留静态入口过滤及现有回放等待机制。</td></tr>
+    <tr><td>建议新增 <code>server/checks/</code></td><td>以规则插件管理适用条件、判定与配置，先实现可见错误、持续 loading、控件反馈。</td></tr>
+    <tr><td><code>evidence-quality.ts / report.ts / ai-evidence.ts</code></td><td>合并展示规则与 AI 发现；移除完成即通过；性能按 metricScope 判定，不用问题文案关键词决定过滤。</td></tr>
+    <tr><td>工作台 / 体检结果 / 问题中心 / 导出</td><td>提供无模型基础报告、检查结果和覆盖缺口，保持网页与 Word/Excel 相同口径。</td></tr>
+    <tr><td><code>server/store.ts</code></td><td>首期继续 SQLite；新增证据做有界摘要。长录制确有增长压力后，将 occurrence/附件索引与运行摘要分离，减少整条 Run JSON 重写。</td></tr>
+  </tbody></table></div>
+  <p>保留现有模块化单体和本机浏览器，不需要为了这些能力先迁移数据库、改框架或拆微服务。只读检查不改变被测页面；未来主动复检需要独立 actionRisk=read/write/unknown，不能沿用当前用于失败策略的 effect 字段判断副作用。</p>
+
+  <h2 id="roadmap">七、三阶段实施与验收</h2>
+  <div class="table-wrap"><table><thead><tr><th>阶段</th><th>交付范围</th><th>完成门槛</th></tr></thead><tbody>
+    <tr><td>第一阶段：结论可信、页面可感知</td><td>规则事实不被 AI 覆盖；基础报告独立；检查模型与 UNKNOWN；错误反馈、loading、控件变化；iframe 断言；范围与文档一致。</td><td>无模型可看/导出报告；AI 空 findings 不删规则事件；无验证不通过；每类通用规则有故障与正常对照；帧内断言不被顶层同名文本满足；静态资源全排除。</td></tr>
+    <tr><td>第二阶段：项目适配、实时系统</td><td>业务码/遮罩/关键锚点配置；交互性能；按项目需要启用 WS/SSE 统计与异常窗口；新鲜度约定；覆盖缺口与证据完整度。</td><td>配置可版本化复用；实时数值不变不误报；配置新鲜度后停更能检测；高频通信长期录制不持续堆积全文；未知/不支持明确显示。</td></tr>
+    <tr><td>第三阶段：复检和效率</td><td>稳定问题指纹、基线比较、修复复测；按需可用性/视觉检查与主动探测模式；长录制存储优化。</td><td>跨运行能识别新增、持续、消失和未复测问题；没有访问或证据的旧问题不能直接标已解决；写操作不自动重试，未知动作不静默重复提交。</td></tr>
+  </tbody></table></div>
+  <h3>建议用于验收的受控场景</h3>
+  <ol>
+    <li>HTTP 500、业务码失败与错误 Toast：事实、检查和问题都能回到同一页面/动作；AI遗漏不擦除。</li>
+    <li>HTTP 400 配合明确合法校验：按项目约定归为预期现象；约定未知时待确认。</li>
+    <li>加载遮罩不消失与瞬时 loading 对照：只把达到适用条件的超时判失败。</li>
+    <li>正常空列表、缓存命中结果相同、复制按钮：不会因无数据/无视觉变化判确定缺陷。</li>
+    <li>菜单展开、页签切换、弹窗打开与关闭：通用后置检查有独立证据。</li>
+    <li>iframe/嵌套 iframe：帧内文本有/无及顶层同名文本三组断言。</li>
+    <li>Canvas 大屏：不按 DOM 文本为空判白屏；内容判断能力显示限制。</li>
+    <li>WS/SSE 正常空闲、断连重连、按配置停更：连接事实与新鲜度检查分开。</li>
+    <li>长列表、大正文、暂停/恢复、截图失败：报告显示真实截断和未覆盖信息。</li>
+    <li>相同接口在不同模块失败：聚合后仍可定位所有模块和步骤。</li>
+    <li>纯静态请求和加载日志：无论成功/失败均不进入问题与 AI；业务运行时异常不因 .js 来源被误过滤。</li>
+    <li>无模型、模型失败、模型完成、导出报告：同一事实和检查的口径一致。</li>
+  </ol>
+  <p>覆盖能力用故障类别召回、确认问题准确率、证据可追溯率、人工复核量、采集开销与单次录制数据量评价。先建立样例基线，再设数值门槛；“多报问题”或“AI生成更多用例”不作为成功标准。</p>
+  <p>优先启动第一阶段，其余能力按典型煤矿项目验证后逐步加入。自动菜单遍历、弱网切换、批量边界输入、持续视频、多浏览器矩阵、复杂视觉基线、后端 APM 与团队分布式执行推迟；复杂业务、压力测试、安全渗透和工业控制结果验证另列专项。</p>
+</main></body>
+</html>

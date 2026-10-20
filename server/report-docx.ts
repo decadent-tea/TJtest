@@ -173,7 +173,7 @@ function table(headers: string[], rows: string[][]) {
   const cell = (value: string, width: number, heading: boolean) =>
     `<w:tc><w:tcPr><w:tcW w:w="${width}" w:type="dxa"/><w:tcMar><w:top w:w="100" w:type="dxa"/><w:left w:w="100" w:type="dxa"/><w:bottom w:w="100" w:type="dxa"/><w:right w:w="100" w:type="dxa"/></w:tcMar>${heading ? '<w:shd w:fill="E7E7E7"/>' : ""}</w:tcPr>${paragraph(value, "table")}</w:tc>`;
   const row = (values: string[], heading: boolean) =>
-    `<w:tr><w:trPr>${heading ? "<w:tblHeader/>" : ""}</w:trPr>${values.map((value, index) => cell(value, widths[index], heading)).join("")}</w:tr>`;
+    `<w:tr><w:trPr><w:cantSplit/>${heading ? "<w:tblHeader/>" : ""}</w:trPr>${values.map((value, index) => cell(value, widths[index], heading)).join("")}</w:tr>`;
   return `<w:tbl><w:tblPr><w:tblW w:w="8500" w:type="dxa"/><w:tblLayout w:type="fixed"/><w:tblBorders><w:top w:val="single" w:sz="4" w:color="808080"/><w:left w:val="single" w:sz="4" w:color="808080"/><w:bottom w:val="single" w:sz="4" w:color="808080"/><w:right w:val="single" w:sz="4" w:color="808080"/><w:insideH w:val="single" w:sz="4" w:color="B0B0B0"/><w:insideV w:val="single" w:sz="4" w:color="B0B0B0"/></w:tblBorders></w:tblPr><w:tblGrid>${widths.map((width) => `<w:gridCol w:w="${width}"/>`).join("")}</w:tblGrid>${row(headers, true)}${rows.map((values) => row(values, false)).join("")}</w:tbl>`;
 }
 

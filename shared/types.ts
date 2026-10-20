@@ -65,6 +65,27 @@ export interface Operation {
   enabled: boolean;
 }
 export interface NetworkCall {
+  completion?: "pending" | "complete" | "stopped" | "failed" | "streaming";
+  bodyState?:
+    | "captured"
+    | "sampled"
+    | "empty"
+    | "unavailable"
+    | "streaming"
+    | "not-applicable";
+  businessMarkers?: Record<string, unknown>;
+  events?: {
+    id: string;
+    startedAt: string;
+    pageId: string;
+    stepId?: string;
+    framePath?: string[];
+    duration?: number;
+    status?: number;
+    failure?: string;
+  }[];
+  framePath?: string[];
+  association?: "action-context" | "time-candidate" | "page" | "unknown";
   occurrences?: number;
   lastSeen?: string;
   maxDuration?: number;
@@ -99,7 +120,42 @@ export interface LogEvent {
   text: string;
   location?: string;
 }
+export interface PageObservation {
+  id: string;
+  timestamp: string;
+  pageId: string;
+  stepId?: string;
+  url: string;
+  status?: number;
+  failure?: string;
+  kind: "navigation";
+}
+export interface PageFeedback {
+  id: string;
+  timestamp: string;
+  lastSeen?: string;
+  occurrences?: number;
+  pageId: string;
+  framePath: string[];
+  stepId?: string;
+  candidateStepIds?: string[];
+  association: "time-candidate" | "ambiguous" | "page";
+  kind: "message" | "dialog" | "url" | "title" | "loading" | "empty";
+  change: "appeared" | "changed" | "disappeared" | "initial";
+  level?: "error" | "success" | "warning" | "info" | "unknown";
+  text?: string;
+  before?: string;
+  after?: string;
+  target?: string;
+  truncated?: boolean;
+}
 export interface Finding {
+  explanationSource?: "ai";
+  metricScope?: "requestDuration" | "uiResponse" | "longTask";
+  owners?: ProblemOwner[];
+  ownershipSource?: "rule" | "ai" | "manual";
+  factIds?: string[];
+  factVersion?: number;
   id: string;
   disposition?: "open" | "investigating" | "resolved";
   note?: string;
@@ -127,6 +183,13 @@ export interface Finding {
   suggestion?: string;
   validationSteps?: string[];
 }
+export type ProblemOwner =
+  | "frontend"
+  | "backend"
+  | "operations"
+  | "implementation"
+  | "other"
+  | "undetermined";
 export interface TestCase {
   id: string;
   module: string;
@@ -138,6 +201,8 @@ export interface TestCase {
   evidenceIds: string[];
 }
 export interface Analysis {
+  evidenceVersion?: number;
+  concurrency?: number;
   status: "NONE" | "RUNNING" | "COMPLETED" | "FAILED";
   summary?: string;
   conclusion?: string;
@@ -183,6 +248,22 @@ export interface Analysis {
     truncatedFields: number;
     analysisRecords?: number;
     groupedRecords?: number;
+    requestCalls?: number;
+    requestRepresentatives?: number;
+    selectedSteps?: number;
+    compactedSteps?: number;
+    inputCharacters?: number;
+    pageObservations?: number;
+    diagnosticSteps?: number;
+    evidenceSteps?: number;
+    partialEvidenceSteps?: number;
+    missingEvidenceSteps?: number;
+    assertedSteps?: number;
+    bodyLimitedRequests?: number;
+    pendingRequests?: number;
+    feedbackRecords?: number;
+    feedbackEvents?: number;
+    ambiguousFeedback?: number;
   };
   warnings?: string[];
   findings: Finding[];
@@ -195,6 +276,10 @@ export interface Analysis {
   }[];
 }
 export interface Run {
+  feedback?: PageFeedback[];
+  feedbackCapture?: { events: number; discarded: number; truncated: number };
+  pageObservations?: PageObservation[];
+  evidenceVersion?: number;
   captureStats?: {
     requests: number;
     logs: number;
@@ -202,6 +287,9 @@ export interface Run {
     filteredLogs: number;
     mergedRequests: number;
     mergedLogs: number;
+    apiRequests?: number;
+    excludedApiRequests?: number;
+    staticRequests?: number;
   };
   id: string;
   name: string;
@@ -261,6 +349,8 @@ export interface ModelProfile {
   aiSynthesis?: boolean;
 }
 export interface Summary {
+  requestRecordCount?: number;
+  endpointCount?: number;
   id: string;
   name: string;
   project: string;

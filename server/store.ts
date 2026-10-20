@@ -1,4 +1,5 @@
 import { finalFindings } from "./evidence-quality";
+import { requestStats } from "../shared/inspection-evidence";
 import { DatabaseSync } from "node:sqlite";
 import {
   mkdirSync,
@@ -16,10 +17,20 @@ const db = new DatabaseSync(resolve(dataRoot, "studio.sqlite"));
 db.exec(
   "PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS records (kind TEXT NOT NULL, id TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(kind,id));",
 );
+const versions = new Map<string, number>();
+export function storeVersion(kind: string) {
+  // data_version also invalidates cached summaries after another connection
+  // changes the database. Local writes use the counter on this connection.
+  const external = db.prepare("PRAGMA data_version").get() as {
+    data_version: number;
+  };
+  return `${versions.get(kind) || 0}:${external.data_version}`;
+}
 export function put<T extends { id: string }>(kind: string, value: T) {
   db.prepare(
     "INSERT INTO records(kind,id,payload) VALUES(?,?,?) ON CONFLICT(kind,id) DO UPDATE SET payload=excluded.payload",
   ).run(kind, value.id, JSON.stringify(value));
+  versions.set(kind, (versions.get(kind) || 0) + 1);
   return value;
 }
 export function get<T>(kind: string, id: string): T | undefined {
@@ -36,6 +47,7 @@ export function list<T>(kind: string): T[] {
   ).map((row) => JSON.parse(row.payload));
 }
 export function remove(kind: string, id: string) {
+  versions.set(kind, (versions.get(kind) || 0) + 1);
   return (
     db.prepare("DELETE FROM records WHERE kind=? AND id=?").run(kind, id)
       .changes > 0
@@ -69,6 +81,7 @@ export function deleteArchivedRun(id: string) {
   }
 }
 export function summary(run: Run): Summary {
+  const requests = requestStats(run);
   return {
     id: run.id,
     name: run.name,
@@ -79,7 +92,9 @@ export function summary(run: Run): Summary {
     startedAt: run.startedAt,
     endedAt: run.endedAt,
     operationCount: run.operations.length,
-    requestCount: run.requests.length,
+    requestCount: requests.calls,
+    requestRecordCount: requests.records,
+    endpointCount: requests.endpoints,
     issueCount: finalFindings(run).length,
     archived: run.archived,
     analysisStatus: run.analysis.status,

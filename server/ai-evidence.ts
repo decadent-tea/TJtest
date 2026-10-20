@@ -6,12 +6,23 @@ import {
 } from "./evidence-quality";
 import type { Run, ModelProfile, Analysis } from "../shared/types";
 import { createHash } from "node:crypto";
+import {
+  isExcludedRequest,
+  isExcludedResourceLog,
+  requestStats,
+  requestFact,
+  semanticIdentity,
+  responseMarkers,
+  operationEvidence,
+  evidenceCoverage,
+  feedbackForStep,
+} from "../shared/inspection-evidence";
 
 // Budgets apply to individual calls, never to the length of a recording.
 export const INPUT_CHAR_BUDGET = 24000;
 export type EvidenceItem = {
   key: string;
-  kind: "step" | "request" | "log";
+  kind: "step" | "request" | "log" | "context" | "page" | "feedback";
   timestamp: string;
   members: string[];
   data: Record<string, unknown> & { id: string };
@@ -21,7 +32,7 @@ export function prepareEvidence(run: Run) {
   const clip = (value: string | undefined, length: number) => {
     if (!value || value.length <= length) return value;
     truncatedFields++;
-    return `${value.slice(0, length)}…[摘要截断，完整内容保留在本机记录]`;
+    return `${value.slice(0, length)}…[AI摘要截断，本机证据也可能受采集限额约束]`;
   };
   const items: EvidenceItem[] = [];
   const groups = new Map<string, EvidenceItem>();
@@ -52,7 +63,7 @@ export function prepareEvidence(run: Run) {
       return {
         arrayLength: value.length,
         sample: value.slice(0, 1).map((v) => compactJson(v, depth + 1)),
-        note: "数据采样，完整数据保留本机",
+        note: "数据采样，不代表全量验证；本机采集亦有大小和深度限制",
       };
     if (value && typeof value === "object")
       return Object.fromEntries(
@@ -60,7 +71,12 @@ export function prepareEvidence(run: Run) {
           .slice(0, 20)
           .map(([k, v]) => [k, compactJson(v, depth + 1)]),
       );
-    return typeof value === "string" ? value.slice(0, 200) : value;
+    return typeof value === "string"
+      ? /^data:[^;]+;base64,/i.test(value) ||
+        (value.length > 300 && /^[A-Za-z0-9+/=\s]+$/.test(value))
+        ? `[编码内容省略，${value.length}字符]`
+        : value.slice(0, 200)
+      : value;
   };
   const shape = (value: unknown, depth = 0): unknown => {
     if (depth >= 3) return typeof value;
@@ -97,11 +113,11 @@ export function prepareEvidence(run: Run) {
       }
     }
     if (summary !== body) truncatedFields++;
-    return clip(summary, failed ? 1600 : 700);
+    return clip(summary, failed ? 1600 : 320);
   };
   const add = (item: EvidenceItem, signature?: string) => {
     const previous = signature ? groups.get(signature) : undefined;
-    if (previous) {
+    if (previous && previous.members.length < 16) {
       previous.members.push(...item.members);
       previous.data.occurrences =
         Number(previous.data.occurrences || 1) +
@@ -111,14 +127,6 @@ export function prepareEvidence(run: Run) {
         Number(previous.data.maxDuration || previous.data.duration || 0),
         Number(item.data.maxDuration || item.data.duration || 0),
       );
-      const stepIds = (previous.data.relatedStepIds || []) as string[];
-      if (
-        typeof item.data.stepId === "string" &&
-        !stepIds.includes(item.data.stepId) &&
-        stepIds.length < 8
-      )
-        stepIds.push(item.data.stepId);
-      previous.data.relatedStepIds = stepIds;
       const samples = (previous.data.requestSamples || []) as string[];
       const request = item.data.request;
       if (
@@ -136,7 +144,53 @@ export function prepareEvidence(run: Run) {
       if (signature) groups.set(signature, item);
     }
   };
-  for (const o of run.operations)
+  for (const o of run.operations) {
+    const quiet =
+      ["hover", "scroll"].includes(o.kind) &&
+      !o.error &&
+      !o.assertion &&
+      !["FAILED", "BLOCKED"].includes(o.status) &&
+      !run.requests.some((r) => r.stepId === o.id && !isExcludedRequest(r)) &&
+      !run.logs.some((l) => l.stepId === o.id && !isExcludedResourceLog(l));
+    const pageEvidence = (run.pageObservations || []).some(
+      (p) => p.stepId === o.id,
+    );
+    if (quiet && !pageEvidence && !feedbackForStep(run, o.id).length) {
+      const previous = items.at(-1);
+      if (
+        previous?.kind === "context" &&
+        previous.data.pageId === o.pageId &&
+        previous.data.module === o.module &&
+        previous.data.scene === o.scene &&
+        previous.data.kind === o.kind
+      ) {
+        previous.members.push(`step:${o.id}`);
+        previous.data.actionCount = previous.members.length;
+        previous.data.lastSequence = o.sequence;
+        previous.data.lastTarget = clip(o.label, 100);
+      } else
+        items.push({
+          key: `context:${o.id}`,
+          kind: "context",
+          timestamp: o.timestamp,
+          members: [`step:${o.id}`],
+          data: {
+            id: o.id,
+            pageId: o.pageId,
+            module: o.module,
+            scene: o.scene,
+            kind: o.kind,
+            firstSequence: o.sequence,
+            lastSequence: o.sequence,
+            firstTarget: clip(o.label, 100),
+            lastTarget: clip(o.label, 100),
+            actionCount: 1,
+            observedEffect:
+              "未自动判读页面效果；可能属于菜单展开或滚动前置。仅作场景上下文，不生成单独用例。",
+          },
+        });
+      continue;
+    }
     items.push({
       key: `step:${o.id}`,
       kind: "step",
@@ -156,19 +210,36 @@ export function prepareEvidence(run: Run) {
         // Compact outcome signals keep step judgement grounded even if full evidence
         // falls into another batch. Raw payloads are sent only once as request items.
         outcome: {
-          requests: run.requests.filter(
-            (r) => r.stepId === o.id && !isStaticAssetUrl(r.url),
-          ).length,
+          feedback: feedbackForStep(run, o.id)
+            .slice(0, 5)
+            .map((f) => ({
+              id: f.id,
+              kind: f.kind,
+              association: f.association,
+              level: f.level,
+              change: f.change,
+            })),
+          evidence: operationEvidence(run, o),
+          navigation: (run.pageObservations || [])
+            .filter((p) => p.stepId === o.id)
+            .map((p) => ({
+              url: clip(p.url, 500),
+              status: p.status,
+              failure: clip(p.failure, 300),
+            })),
+          requests: run.requests
+            .filter((r) => r.stepId === o.id && !isExcludedRequest(r))
+            .reduce((n, r) => n + countOf(r), 0),
           errors: [
             ...new Set(
               run.requests
-                .filter((r) => r.stepId === o.id && !isStaticAssetUrl(r.url))
+                .filter((r) => r.stepId === o.id && !isExcludedRequest(r))
                 .flatMap((r) =>
                   requestProblem(r)
                     ? [
                         r.method +
                           " " +
-                          new URL(r.url, run.url).pathname +
+                          r.url.split("?")[0] +
                           ": " +
                           requestProblem(r),
                       ]
@@ -179,40 +250,21 @@ export function prepareEvidence(run: Run) {
           console: [
             ...new Set(
               run.logs
-                .filter((l) => l.stepId === o.id)
+                .filter((l) => l.stepId === o.id && !isExcludedResourceLog(l))
                 .map((l) => l.level + ": " + l.text.slice(0, 200)),
             ),
           ].slice(0, 4),
         },
       },
     });
+  }
   let omittedResources = 0;
   for (const r of run.requests) {
-    if (isStaticAssetUrl(r.url)) {
+    if (isExcludedRequest(r)) {
       omittedResources++;
       continue;
     }
-    // Successful static assets add little business evidence; static failures still enter analysis.
-    if (
-      (isSuccessfulStaticAsset(r) ||
-        r.category === "resource" ||
-        (!!r.status &&
-          r.status < 400 &&
-          [
-            "script",
-            "stylesheet",
-            "image",
-            "font",
-            "media",
-            "manifest",
-          ].includes(r.resourceType))) &&
-      !r.failure &&
-      !(r.status && r.status >= 400)
-    ) {
-      omittedResources++;
-      continue;
-    }
-    const failed = !!r.failure || !!(r.status && r.status >= 400);
+    const failed = !!requestProblem(r);
     let responseSignature = r.responseBody;
     let requestSignature = r.requestBody;
     let urlSignature = r.url;
@@ -247,19 +299,26 @@ export function prepareEvidence(run: Run) {
         data: {
           id: r.id,
           stepId: r.stepId,
-          module: clip(r.module, 300),
-          description: clip(r.description, 500),
+          module: clip(r.module, 120),
+          description: clip(r.description, 160),
           method: r.method,
-          url: clip(r.url, 1500),
+          url: clip(r.url, failed ? 1500 : 500),
           status: r.status,
           failure: clip(r.failure, 1000),
           duration: r.duration,
           occurrences: countOf(r),
           maxDuration: r.maxDuration ?? r.duration,
           resourceType: r.resourceType,
-          request: clip(r.requestBody, 1000),
+          request: clip(
+            responseSummary(r.requestBody, failed),
+            failed ? 1000 : 320,
+          ),
           response: responseSummary(r.responseBody, failed),
-          bodyNote: clip(r.bodyNote, 500),
+          bodyNote: clip(r.bodyNote, 160),
+          completion: r.completion,
+          bodyState: r.bodyState,
+          businessMarkers: responseMarkers(r),
+          association: r.association || "time-candidate",
         },
       },
       digest([
@@ -270,47 +329,89 @@ export function prepareEvidence(run: Run) {
         r.failure,
         r.module,
         r.description,
+        semanticIdentity(r),
         requestSignature,
         responseSignature,
+        r.completion,
+        r.bodyState,
+        responseMarkers(r),
       ]),
     );
   }
   for (const l of run.logs)
-    add(
-      {
-        key: `log:${l.id}`,
-        kind: "log",
-        timestamp: l.timestamp,
-        members: [`log:${l.id}`],
-        data: {
-          id: l.id,
-          stepId: l.stepId,
+    if (!isExcludedResourceLog(l))
+      add(
+        {
+          key: `log:${l.id}`,
+          kind: "log",
           timestamp: l.timestamp,
-          level: l.level,
-          occurrences: countOf(l),
-          text: clip(
-            l.text,
-            [
-              "error",
-              "pageerror",
-              "unhandledrejection",
-              "warn",
-              "warning",
-            ].includes(l.level)
-              ? 2000
-              : 600,
-          ),
-          location: clip(l.location, 500),
+          members: [`log:${l.id}`],
+          data: {
+            id: l.id,
+            stepId: l.stepId,
+            timestamp: l.timestamp,
+            level: l.level,
+            occurrences: countOf(l),
+            text: clip(
+              l.text,
+              [
+                "error",
+                "pageerror",
+                "unhandledrejection",
+                "warn",
+                "warning",
+              ].includes(l.level)
+                ? 2000
+                : 600,
+            ),
+            location: clip(l.location, 500),
+          },
         },
+        digest([
+          "log",
+          l.level,
+          l.text,
+          l.location,
+          run.operations.find((o) => o.id === l.stepId)?.module,
+        ]),
+      );
+  for (const p of run.pageObservations || [])
+    if (p.failure || (p.status && p.status >= 400))
+      items.push({
+        key: `page:${p.id}`,
+        kind: "page",
+        timestamp: p.timestamp,
+        members: [`page:${p.id}`],
+        data: { ...p, url: clip(p.url, 1000), failure: clip(p.failure, 500) },
+      });
+  const facts = new Map<string, ReturnType<typeof requestFact>>();
+  for (const f of run.feedback || [])
+    items.push({
+      key: `feedback:${f.id}`,
+      kind: "feedback",
+      timestamp: f.timestamp,
+      members: [`feedback:${f.id}`],
+      data: {
+        ...f,
+        text: clip(f.text, 500),
+        before: clip(f.before, 1000),
+        after: clip(f.after, 1000),
+        target: clip(f.target, 200),
+        occurrences: countOf(f),
       },
-      digest([
-        "log",
-        l.level,
-        l.text,
-        l.location,
-        run.operations.find((o) => o.id === l.stepId)?.module,
-      ]),
-    );
+    });
+  for (const item of items)
+    if (item.kind === "request") {
+      const ids = new Set(item.members.map((m) => m.slice(m.indexOf(":") + 1)));
+      const fact = requestFact(
+        run,
+        run.requests.filter((r) => ids.has(r.id)),
+        `fact:${item.data.id}`,
+      );
+      facts.set(fact.id, fact);
+      Object.assign(item.data, { scope: fact.scope, factId: fact.id });
+      if (fact.scope === "run") delete item.data.stepId;
+    }
   items.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
   const meta = {
     name: clip(run.name, 200),
@@ -318,14 +419,38 @@ export function prepareEvidence(run: Run) {
     environment: clip(run.environment, 100),
     notes: run.notes.slice(-4).map((n) => clip(n, 250)),
   };
+  const completeness = evidenceCoverage(run);
   const coverage: NonNullable<Analysis["coverage"]> = {
     steps: run.operations.length,
-    requests: run.requests.length - omittedResources,
+    requests: requestStats(run).records,
     logs: run.logs.length,
     omittedResources,
     truncatedFields,
+    pageObservations: (run.pageObservations || []).length,
+    feedbackRecords: (run.feedback || []).length,
+    feedbackEvents: (run.feedback || []).reduce((n, f) => n + countOf(f), 0),
+    ambiguousFeedback: (run.feedback || []).filter(
+      (f) => f.association === "ambiguous",
+    ).length,
+    diagnosticSteps: completeness.eligibleSteps,
+    evidenceSteps: completeness.withEvidence,
+    partialEvidenceSteps: completeness.partialSteps,
+    missingEvidenceSteps: completeness.withoutEvidence,
+    assertedSteps: completeness.assertedSteps,
+    bodyLimitedRequests: completeness.requestBodyLimited,
+    pendingRequests: completeness.pendingRequests,
     analysisRecords: items.length,
     groupedRecords: items.reduce((sum, i) => sum + i.members.length - 1, 0),
+    requestCalls: requestStats(run).calls,
+    requestRepresentatives: items.filter((i) => i.kind === "request").length,
+    selectedSteps: items.filter((i) => i.kind === "step").length,
+    compactedSteps: items
+      .filter((i) => i.kind === "context")
+      .reduce((n, i) => n + i.members.length, 0),
+    inputCharacters: items.reduce(
+      (n, i) => n + JSON.stringify(i.data).length,
+      0,
+    ),
   };
   const byKey = new Map(items.map((item) => [item.key, item]));
   const byStep = new Map(
@@ -338,20 +463,77 @@ export function prepareEvidence(run: Run) {
     );
     const contextIds = new Set<string>();
     for (const item of chosen) {
-      const stepId = item.data.stepId;
-      if (typeof stepId === "string" && !stepIds.has(stepId))
-        contextIds.add(stepId);
+      for (const stepId of [
+        item.data.stepId,
+        ...((item.data.candidateStepIds as string[] | undefined) || []),
+        ...(facts
+          .get(String(item.data.factId))
+          ?.perStepCounts.map((s) => s.stepId) || []),
+      ])
+        if (typeof stepId === "string" && !stepIds.has(stepId))
+          contextIds.add(stepId);
     }
+    const relatedSteps = new Set([...stepIds, ...contextIds]);
+    const chosenFeedback = new Set(
+      chosen.filter((i) => i.kind === "feedback").map((i) => i.data.id),
+    );
+    const relatedFeedback = (run.feedback || []).filter(
+      (f) =>
+        !chosenFeedback.has(f.id) &&
+        [f.stepId, ...(f.candidateStepIds || [])].some(
+          (id) => id && relatedSteps.has(id),
+        ),
+    );
     return {
       run: meta,
       scope: {
         ...coverage,
         batchRecords: chosen.length,
-        note: "这是完整录制中的一个批次，不得把本批当作整次体检。同模块同接口的正常调用按响应结构与业务状态分组合并，重复日志合并，参数及数据为代表采样，不代表每份数据都已验证。异常调用按完整内容比较。引用代表ID会在本机扩展为全部原始记录ID。contextSteps 仅供定位、不生成用例。完整证据保留本机。",
+        limitations: completeness.limitations,
+        note: "这是整次录制的一个批次。scope=run的请求是跨步骤统计，次数不得分配给代表步骤；每步次数以facts.perStepCounts为准。时间归属只是候选；重复总量不证明重复提交。数据是限额样本，contextSteps和navigationContext仅供定位、不生成用例；全部原始操作保留供回放，本机正文亦受采集限额约束。",
       },
       steps: chosen.filter((i) => i.kind === "step").map((i) => i.data),
       requests: chosen.filter((i) => i.kind === "request").map((i) => i.data),
       logs: chosen.filter((i) => i.kind === "log").map((i) => i.data),
+      pageObservations: chosen
+        .filter((i) => i.kind === "page")
+        .map((i) => i.data),
+      feedback: chosen.filter((i) => i.kind === "feedback").map((i) => i.data),
+      contextFeedback: relatedFeedback
+        .slice(0, 4)
+        .map((f) => ({
+          ...f,
+          text: clip(f.text, 300),
+          before: clip(f.before, 500),
+          after: clip(f.after, 500),
+        })),
+      omittedContextFeedback: Math.max(0, relatedFeedback.length - 4),
+      facts: chosen
+        .filter((i) => i.kind === "request")
+        .map((i) => {
+          const f = facts.get(String(i.data.factId))!;
+          return {
+            id: f.id,
+            scope: f.scope,
+            calls: f.calls,
+            records: f.records,
+            perStepCounts: f.perStepCounts.map((s) => ({
+              sequence: s.sequence,
+              calls: s.calls,
+              ...(s.sequence === undefined
+                ? { pageId: s.pageId, stepId: s.stepId }
+                : {}),
+            })),
+            timeWindow:
+              f.firstSeen === f.lastSeen
+                ? [f.firstSeen]
+                : [f.firstSeen, f.lastSeen],
+          };
+        }),
+      navigationContext: chosen
+        .filter((i) => i.kind === "context")
+        .map((i) => i.data),
+      omittedContextSteps: Math.max(0, contextIds.size - 4),
       contextSteps: [...contextIds].slice(0, 4).flatMap((id) => {
         const data = byStep.get(id)?.data;
         return data
@@ -414,6 +596,7 @@ export function prepareEvidence(run: Run) {
     pack,
     coverage,
     aliases,
+    facts,
     count,
     rawRecords: items.reduce((sum, i) => sum + i.members.length, 0),
   };

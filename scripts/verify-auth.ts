@@ -11,6 +11,8 @@ import {
 } from "playwright";
 import { apiLogin, captchaText, fillCaptcha } from "./fixtures/auth";
 import type { User } from "../shared/auth";
+import type { Run } from "../shared/types";
+import { finalizeReport } from "../server/report";
 
 const directory = resolve("output", "verification-auth", String(Date.now()));
 mkdirSync(directory, { recursive: true });
@@ -133,6 +135,61 @@ try {
       extraHTTPHeaders: headers,
     });
     contexts.push(adminRequest);
+  });
+  await test("问题归属真实接口鉴权、输入校验与持久化", async () => {
+    const sample: Run = {
+      id: "ownership-api",
+      name: "归属接口夹具",
+      project: "测试",
+      environment: "独立",
+      url: "http://fixture.test",
+      mode: "record",
+      status: "COMPLETED",
+      startedAt: new Date().toISOString(),
+      scene: "页面",
+      archived: false,
+      operations: [],
+      requests: [],
+      logs: [
+        {
+          id: "runtime-error",
+          pageId: "page",
+          timestamp: new Date().toISOString(),
+          level: "pageerror",
+          text: "TypeError: 归属测试",
+        },
+      ],
+      notes: [],
+      findings: [],
+      cases: [],
+      analysis: { status: "NONE", findings: [] },
+    };
+    finalizeReport(sample);
+    put("run", sample);
+    const url = `${base}/api/runs/${sample.id}/findings/${sample.findings[0].id}/ownership`;
+    assert.equal(
+      (await anonymous.post(url, { data: { owners: ["backend"] } })).status(),
+      401,
+    );
+    assert.equal(
+      (
+        await adminRequest.post(url, { data: { owners: ["invalid"] } })
+      ).status(),
+      400,
+    );
+    const saved = await adminRequest.post(url, {
+      data: { owners: ["frontend", "backend"] },
+    });
+    assert.equal(saved.status(), 200, await saved.text());
+    const current = await (
+      await adminRequest.get(`${base}/api/runs/${sample.id}`)
+    ).json();
+    assert.deepEqual(current.findings[0].owners, ["frontend", "backend"]);
+    assert.equal(current.findings[0].ownershipSource, "manual");
+    assert.deepEqual(get<Run>("run", sample.id)?.findings[0].owners, [
+      "frontend",
+      "backend",
+    ]);
   });
   await test("用户新增、重复账号校验、详情查看、编辑与搜索", async () => {
     await page.getByRole("button", { name: "新增用户", exact: true }).click();

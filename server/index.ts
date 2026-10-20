@@ -10,7 +10,6 @@ import {
   list,
   remove,
   deleteArchivedRun,
-  summary,
   dataRoot,
   encrypt,
   publicProfile,
@@ -27,7 +26,8 @@ import {
   answerDialog,
 } from "./recorder";
 import { finalizeReport, reportHtml } from "./report";
-import { preparedReport, prewarmReport, forgetReport } from "./report-cache";
+import { preparedReport, forgetReport } from "./report-cache";
+import { runSummaries } from "./run-summaries";
 import { analyze, callModel, cancelAnalysis } from "./ai";
 import { casesWorkbook } from "./export";
 import { attachmentHeader, downloadName } from "./download-name";
@@ -94,14 +94,11 @@ const recordingSchema = z.object({
   url: urlSchema,
   headless: z.boolean().optional(),
 });
-app.get("/api/runs", (_req, res) =>
-  res.json(list<Run>("run").map((r) => summary(readRun(r.id) || r))),
-);
+app.get("/api/runs", (_req, res) => res.json(runSummaries()));
 app.get(
   "/api/runs/:id",
   route((req, res) => {
     const run = requiredRun(req.params.id as string);
-    if (run.analysis.status === "COMPLETED") prewarmReport(run);
     res.json(run);
   }),
 );
@@ -277,11 +274,62 @@ app.put(
       .object({
         disposition: z.enum(["open", "investigating", "resolved"]),
         note: z.string().max(2000),
+        owners: z
+          .array(
+            z.enum([
+              "frontend",
+              "backend",
+              "operations",
+              "implementation",
+              "other",
+              "undetermined",
+            ]),
+          )
+          .min(1)
+          .max(6)
+          .optional(),
       })
       .parse(req.body);
     Object.assign(finding, body);
+    if (body.owners) finding.ownershipSource = "manual";
     put("run", run);
     res.json(finding);
+  }),
+);
+app.post(
+  "/api/runs/:id/findings/:findingId/ownership",
+  route((req, res) => {
+    const run = requiredRun(req.params.id as string);
+    const finding = [...run.findings, ...run.analysis.findings].find(
+      (f) => f.id === req.params.findingId && !f.deleted,
+    );
+    if (!finding) {
+      res.status(404).json({ error: "问题不存在。" });
+      return;
+    }
+    finding.owners = [
+      ...new Set(
+        z
+          .array(
+            z.enum([
+              "frontend",
+              "backend",
+              "operations",
+              "implementation",
+              "other",
+              "undetermined",
+            ]),
+          )
+          .min(1)
+          .max(6)
+          .parse(req.body.owners),
+      ),
+    ];
+    finding.ownershipSource = "manual";
+    finalizeReport(run);
+    put("run", run);
+    forgetReport(run.id);
+    res.json(run);
   }),
 );
 app.delete(

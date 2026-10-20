@@ -64,6 +64,11 @@ app.post("/chat/completions", (req, res) => {
   assert(systemPrompt.includes("reproductionSteps"));
   assert(systemPrompt.includes("置信度"));
   assert(systemPrompt.includes("HTTP 2xx"));
+  assert(systemPrompt.includes("不要求接口、控制台、页面现象同时出现"));
+  assert(systemPrompt.includes("根因未知、没有控制台错误或缺少业务断言"));
+  assert(systemPrompt.includes("不以确定唯一根因为前提"));
+  assert(systemPrompt.includes("按可能性排序"));
+  assert(systemPrompt.includes("只有错误内容过于笼统、确实毫无线索时"));
   if (rateLimitOnce) {
     rateLimitOnce = false;
     res.status(429).json({ error: "test rate limit" });
@@ -118,7 +123,7 @@ app.post("/chat/completions", (req, res) => {
             summary: `本批检查 ${bundle.steps.length} 个步骤、${bundle.requests.length} 个请求、${bundle.logs.length} 条日志。观察异常，不推断未经验证的通过结论。`,
             findings: [
               ...failedRequests.map((r: { id: string }) => ({
-                title: "重复接口故障",
+                title: "接口返回错误",
                 module: "设备台账",
                 severity: "high",
                 category: "interface",
@@ -126,7 +131,8 @@ app.post("/chat/completions", (req, res) => {
                 observation: "GET /api/data 接口返回 HTTP 500。",
                 impact: "对应设备数据无法取得，当前操作可能无法完成。",
                 reproductionSteps: ["进入设备台账", "执行数据查询"],
-                possibleCause: "服务端处理异常，具体根因需结合服务日志核查。",
+                possibleCause:
+                  acceptedCalls % 2 ? "现有记录不能确定唯一根因。" : undefined,
                 suggestion: "核查后端。",
                 validationSteps: ["重放查询并断言 HTTP 状态和业务码"],
                 evidenceIds: [r.id],
@@ -279,9 +285,9 @@ try {
     },
   ];
   const resources = prepareEvidence(resourceRun);
-  assert.equal(resources.coverage.omittedResources, 1);
+  assert.equal(resources.coverage.omittedResources, 2);
   assert(!resources.items.some((i) => i.data.id === "successful-resource"));
-  assert(resources.items.some((i) => i.data.id === "failed-resource"));
+  assert(!resources.items.some((i) => i.data.id === "failed-resource"));
   assert(JSON.stringify(prepared.items).length > 200000);
   for (const keys of prepared.pack(profile))
     assert(JSON.stringify(prepared.bundle(keys)).length <= INPUT_CHAR_BUDGET);
@@ -344,7 +350,9 @@ try {
   assert.equal(successfulKeys.size, 760);
   assert(capacitySplits > 0, "未覆盖自动缩小上下文批次");
   assert(outputSplits > 0, "未覆盖自动缩小输出批次");
-  assert(summaryCalls >= 1, "管理结论未生成");
+  assert.equal(summaryCalls, 0, "汇总不得再次调用模型扩写未经观察的影响");
+  assert(recovered.analysis.summary?.includes("观察证据："));
+  assert(recovered.analysis.conclusion?.includes("明确断言通过"));
   assert(
     recovered.analysis.findings.some((f) =>
       f.evidenceIds.includes("tail-request"),
@@ -354,15 +362,43 @@ try {
     recovered.analysis.findings.some((f) => f.evidenceIds.includes("tail-log")),
   );
   const merged = recovered.analysis.findings.find(
-    (f) => f.title === "重复接口故障",
+    (f) => f.title === "接口返回错误",
   )!;
-  assert.equal(merged.evidenceIds.length, 2);
+  assert.equal(
+    recovered.analysis.findings.filter((f) => f.title === "接口返回错误")
+      .length,
+    2,
+    "不同端点不能仅因AI标题相同就合并",
+  );
+  assert.equal(merged.evidenceIds.length, 1);
   assert.equal(merged.category, "interface");
   assert.equal(merged.confidence, "high");
+  assert(merged.possibleCause);
+  assert(
+    merged.possibleCause?.includes("优先怀疑"),
+    "模型留空或仅拒绝判断时按HTTP500补全候选原因",
+  );
+  assert(!merged.possibleCause.includes("不能确定唯一根因"));
+  assert(merged.detail.includes(merged.possibleCause));
   assert(merged.observation?.includes("HTTP 500"));
-  assert(merged.reproductionSteps?.includes("执行数据查询"));
+  const observedStep = recovered.operations.find((operation) =>
+    recovered.requests.some(
+      (request) =>
+        merged.evidenceIds.includes(request.id) &&
+        request.stepId === operation.id,
+    ),
+  );
+  assert(observedStep);
+  assert(
+    merged.reproductionSteps?.some((step) => step.includes(observedStep.label)),
+    "复现路径必须还原实际录制动作",
+  );
   assert(merged.validationSteps?.some((step) => step.includes("业务码")));
-  assert.equal(recovered.cases.at(-1)?.status, "PASSED");
+  assert.notEqual(
+    recovered.cases.at(-1)?.status,
+    "PASSED",
+    "limited不得升级为通过",
+  );
   assert(!recovered.cases.at(-1)?.expected.includes("人工确认"));
   assert(reportHtml(recovered).includes("/api/data/329"));
   assert(reportHtml(recovered).includes("观察事实"));
@@ -373,7 +409,9 @@ try {
   console.log(
     "自动缩批：上下文超限与输出截断通过；限流重试、失败续传、重启检查点及去重通过。",
   );
-  console.log("跨批汇总：多级 AI 汇总通过，归档与实际执行状态保持不变。");
+  console.log(
+    "跨批汇总：从已核验问题生成结论，不额外调用模型；归档与实际执行状态保持不变。",
+  );
   const groupedRun = structuredClone(run);
   groupedRun.id = randomUUID();
   groupedRun.operations = groupedRun.operations.slice(0, 2);
@@ -393,7 +431,11 @@ try {
   }));
   groupedRun.analysis = { status: "NONE", findings: [] };
   const groupedEvidence = prepareEvidence(groupedRun);
-  assert.equal(groupedEvidence.items.length, 4);
+  assert.equal(
+    groupedEvidence.items.length,
+    9,
+    "限额分组保持单项输入有界，原始成员仍完整",
+  );
   assert.equal(groupedEvidence.rawRecords, 102);
   put("run", groupedRun);
   await analyze(groupedRun, profile.id);
@@ -405,7 +447,7 @@ try {
   );
   assert.equal(groupedRun.analysis.progress?.processedRecords, 102);
   assert.equal(
-    groupedRun.analysis.findings.find((f) => f.title === "重复接口故障")
+    groupedRun.analysis.findings.find((f) => f.title === "接口返回错误")
       ?.evidenceIds.length,
     20,
   );
@@ -436,7 +478,7 @@ try {
     "HTTP200不同业务状态不应合并",
   );
   console.log(
-    "证据压缩：102 条原始证据合并为 4 项输入，异常定位扩展到全部原始 ID，业务错误码保持区分。",
+    "证据压缩：102 条原始证据合并为 9 项输入，异常定位扩展到全部原始 ID，业务错误码保持区分。",
   );
   // Every actual ID must also be present in the current batch, not just elsewhere in the run.
   invalidCrossBatch = true;
@@ -482,7 +524,7 @@ try {
   assert.equal(omissionRun.analysis.progress?.total, 1);
   assert.equal(omissionRun.analysis.progress?.completed, 1);
   assert.equal(
-    omissionRun.analysis.findings.find((f) => f.title === "重复接口故障")
+    omissionRun.analysis.findings.find((f) => f.title === "接口返回错误")
       ?.evidenceIds.length,
     20,
   );
@@ -531,16 +573,21 @@ try {
   put("run", fallbackRun);
   await analyze(fallbackRun, profile.id);
   await waitAnalysis(fallbackRun);
-  assert.equal(fallbackRun.analysis.status, "FAILED");
-  assert(fallbackRun.analysis.error);
+  assert.equal(fallbackRun.analysis.status, "COMPLETED");
+  assert(!fallbackRun.analysis.error);
   assert(
     fallbackRun.analysis.findings.some((f) =>
       f.evidenceIds.includes("tail-request"),
     ),
   );
-  assert(!fallbackRun.analysis.conclusion);
+  assert(fallbackRun.analysis.conclusion?.includes("明确断言通过"));
+  assert.equal(
+    summaryCalls,
+    0,
+    "摘要不依赖第二次模型请求，避免已完成分析因汇总失败而失败",
+  );
   console.log(
-    "证据校验与降级：拒绝跨批伪造引用，综合摘要调用失败仍保留完整已分析明细。",
+    "证据校验与汇总：拒绝跨批伪造引用，综合结论不再依赖额外模型调用。",
   );
 } finally {
   server.closeAllConnections();
